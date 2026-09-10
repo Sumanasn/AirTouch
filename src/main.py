@@ -148,7 +148,7 @@ def main():
 
             if debug:
                 draw_debug(frame, hands, sm, fps, frozen=frozen_frames > 5)
-                cv2.imshow("gesture-control", frame)
+                cv2.imshow("AirTouch", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

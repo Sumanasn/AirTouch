@@ -1,4 +1,4 @@
-# Gesture_control
+# AirTouch
 
 Control your computer with one hand in front of a webcam. A MediaPipe hand
 tracker feeds a gesture state machine that drives the mouse, scroll wheel,
@@ -101,8 +101,8 @@ webcam ─▶ ThreadedCamera ─▶ HandTracker ─▶ GestureStateMachine ─�
 ## Setup
 
 ```bash
-git clone https://github.com/Sumanasn/Gesture_control.git
-cd Gesture_control
+git clone https://github.com/Sumanasn/AirTouch.git
+cd AirTouch
 
 python -m venv .venv
 .venv\Scripts\activate        # Windows
