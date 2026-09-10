@@ -1,10 +1,17 @@
 """Webcam -> MediaPipe hand landmarks -> gesture state machine -> OS input.
 
+Entry point. Lives at the repo root; the modules it drives are in src/,
+so it puts src/ on the import path before importing them.
+
 Controls: 'q' quits, 'd' toggles the debug overlay. Tracking itself starts
 OFF; hold an open palm (4-5 fingers extended) still for ~0.7s to
 engage/disengage, per the Midas-touch-avoidance design.
 """
+import os
+import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 import cv2
 import numpy as np

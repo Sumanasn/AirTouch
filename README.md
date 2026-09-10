@@ -135,7 +135,7 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS / Linux
 
 pip install -r requirements.txt
-python src/main.py
+python main.py
 ```
 
 The MediaPipe hand model (~7.8 MB) downloads automatically the first time
@@ -218,10 +218,10 @@ frame, not crowding the lens.
 ## Repository layout
 
 ```
+main.py                entry point - run this (puts src/ on the import path)
 README.md
 requirements.txt
 src/
-├── main.py            entry point + debug window
 ├── config.py          all tunable thresholds
 ├── capture.py         threaded webcam capture, stall recovery
 ├── landmarks.py       MediaPipe wrapper, 11-point subset
