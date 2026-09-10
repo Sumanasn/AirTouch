@@ -32,6 +32,11 @@ you reach for the keyboard).
 | Open palm, thumb-side leading, sweep down | **Volume down** |
 
 ---
+## Demo
+
+https://github.com/user-attachments/assets/e2745aa1-b07b-4ebb-8d34-1daf894f0c5f
+
+---
 
 ## How it works
 
