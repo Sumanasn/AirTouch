@@ -75,8 +75,9 @@ webcam ─▶ ThreadedCamera ─▶ HandTracker ─▶ GestureStateMachine ─�
   own moves can't trip pyautogui's corner failsafe.
 - **`config.py`** — every threshold in one place, each with a comment
   explaining the value.
-- **`perf_logger.py`** — buffered CSV telemetry (`telemetry.csv`), flushed
-  off-thread, for tuning thresholds against recorded runs.
+- **`logs/`** — diagnostics only, no effect on gesture recognition:
+  `perf_logger.py` (buffered CSV telemetry, flushed off-thread) and
+  `debug_frames.py` (an annotated JPEG per gesture-state transition).
 
 ---
 
@@ -108,11 +109,12 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS / Linux
 
 pip install -r requirements.txt
-python main.py
+python src/main.py
 ```
 
 The MediaPipe hand model (~7.8 MB) downloads automatically the first time
-you run it.
+you run it. Runtime output (`telemetry.csv`, `debug_frames/`) is written
+next to wherever you launch from, and is gitignored.
 
 ---
 
@@ -190,16 +192,23 @@ frame, not crowding the lens.
 ## Repository layout
 
 ```
-main.py            entry point + debug window
-capture.py         threaded webcam capture, stall recovery
-landmarks.py       MediaPipe wrapper, 11-point subset
-gestures.py        per-finger detectors and primitives
-state_machine.py   pose dispatch, cursor mapping
-filters.py         One-Euro filter
-actions.py         OS input injection (pyautogui)
-config.py          all tunable thresholds
-perf_logger.py     buffered CSV telemetry
+README.md
 requirements.txt
+src/
+├── main.py            entry point + debug window
+├── config.py          all tunable thresholds
+├── capture.py         threaded webcam capture, stall recovery
+├── landmarks.py       MediaPipe wrapper, 11-point subset
+├── gestures.py        per-finger detectors and primitives
+├── state_machine.py   pose dispatch, cursor mapping
+├── filters.py         One-Euro filter
+├── actions.py         OS input injection (pyautogui)
+└── logs/              diagnostics (no effect on recognition)
+    ├── perf_logger.py     buffered CSV telemetry
+    └── debug_frames.py    annotated JPEG per state transition
+
+telemetry.csv + debug_frames/ are written at runtime next to wherever you
+launch from, and are gitignored.
 ```
 
 ---

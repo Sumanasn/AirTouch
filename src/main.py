@@ -4,7 +4,6 @@ Controls: 'q' quits, 'd' toggles the debug overlay. Tracking itself starts
 OFF; hold an open palm (4-5 fingers extended) still for ~0.7s to
 engage/disengage, per the Midas-touch-avoidance design.
 """
-import os
 import time
 
 import cv2
@@ -14,10 +13,10 @@ import pyautogui
 from capture import ThreadedCamera
 from landmarks import HandTracker
 from state_machine import GestureStateMachine
-from perf_logger import PerfLogger
+from logs.perf_logger import PerfLogger
+from logs.debug_frames import save_state_transition_frame
 
 HAND_COLORS = {"Left": (255, 140, 0), "Right": (0, 200, 255)}
-DEBUG_FRAMES_DIR = "debug_frames"
 
 # Mean per-coordinate XY landmark motion (normalized) below this = the feed
 # is frozen. Deliberately excludes Z: it's MediaPipe's noisiest axis, and
@@ -28,30 +27,6 @@ DEBUG_FRAMES_DIR = "debug_frames"
 # "held still" jitters X/Y more than a frozen feed's residual noise.
 _FROZEN_LANDMARK_DELTA = 0.0008
 _FROZEN_FRAMES_BEFORE_REOPEN = 30
-
-
-def save_state_transition_frame(frame, timestamp_ms, telem):
-    os.makedirs(DEBUG_FRAMES_DIR, exist_ok=True)
-    snap = frame.copy()  # clean webcam frame, before the debug overlay draws on it
-    cv2.putText(
-        snap, f"state: {telem.get('active_state', '')}", (10, 40),
-        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
-    )
-    cv2.putText(
-        snap, f"idx: {telem.get('index_ratio', 0):.2f}  mid: {telem.get('middle_ratio', 0):.2f}",
-        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-    )
-    cv2.putText(
-        snap, f"down: {telem.get('fingers_down', '')}", (10, 115),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-    )
-    cv2.putText(
-        snap,
-        f"thumb_v: {telem.get('thumb_zvel', 0):.2f}  idx_v: {telem.get('index_zvel', 0):.2f}  pinch: {telem.get('pinch_ratio', 0):.2f}",
-        (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
-    )
-    # filename matches telemetry.csv's timestamp_ms exactly, for direct lookup
-    cv2.imwrite(f"{DEBUG_FRAMES_DIR}/gesture_{timestamp_ms}.jpg", snap)
 
 
 def draw_arrow(frame):

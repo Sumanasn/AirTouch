@@ -6,7 +6,7 @@ __pycache__/
 # MediaPipe model - downloaded automatically on first run (see landmarks.py)
 hand_landmarker.task
 
-# runtime artifacts
+# runtime artifacts (written next to wherever the app is launched from)
 telemetry.csv
 debug_frames/
 recording_*.mp4
