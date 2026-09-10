@@ -1,21 +1,55 @@
 # AirTouch
 
-Control your computer with one hand in front of a webcam. A MediaPipe hand
-tracker feeds a gesture state machine that drives the mouse, scroll wheel,
-media keys, volume, and Alt+Tab — no wearable, no calibration wizard, just
-a laptop camera.
+Watching a movie and need to pause it? Don't feel like reaching across the
+desk for the spacebar? Hold up a fist. Paused.
 
-Built for latency: threaded capture, an 11-point landmark subset, a
-One-Euro-filtered cursor, and a telemetry log for tuning every threshold
-against real data instead of guesswork.
+Song too loud and your hands are covered in flour? Sweep your palm up or
+down. Volume follows.
+
+Reading something in a tiny font? Trace a checkmark in the air to zoom in,
+pinch to zoom out.
+
+**AirTouch turns the webcam you already have into a control surface.** One
+hand, no wearable, no gloves, no calibration wizard, nothing to plug in.
 
 ---
 
-## Gesture vocabulary
+## What you can do without touching the laptop
 
-Tracking starts **OFF**. Hold an open palm still for ~0.7 s to toggle it on
-or off (a deliberate gate so the cursor doesn't chase your hand the moment
-you reach for the keyboard).
+- **Pause / play** anything — make a fist, or flash an open palm
+- **Volume** up or down — open palm, sweep vertically
+- **Scroll** a recipe or a long page — two fingers up, tilt them
+- **Zoom** in and out — checkmark to zoom in, pinch to zoom out
+- **Move the cursor** — point your index finger and it tracks like a laser
+  pointer; push it forward to click, hold a pinch to drag
+- **Switch windows** — open palm, sweep sideways for Alt+Tab
+
+Tracking starts **OFF** on purpose. Hold a still open palm for about 0.7
+seconds to switch it on or off, so the cursor doesn't chase your hand every
+time you reach for the keyboard.
+
+Under the hood: **MediaPipe Tasks** for hand-landmark detection, **OpenCV**
+for capture and the debug view, a hand-rolled gesture state machine, and
+**pyautogui** for the actual mouse / keyboard / media-key events. Built for
+latency — frames read on a dedicated thread, only 11 of MediaPipe's 21
+landmarks kept, a One-Euro filter (Casiez et al. 2012) smoothing the
+cursor, and a telemetry log so every threshold was picked from recorded
+data rather than guesswork.
+
+---
+
+## Demo
+
+A short recording of the gestures on a live webcam feed.
+
+https://github.com/user-attachments/assets/e2745aa1-b07b-4ebb-8d34-1daf894f0c5f
+
+---
+
+## Gesture reference
+
+The precise version of the list above — exact pose on the left, what it
+does on the right.
 
 | Hand pose | Action |
 |---|---|
@@ -30,14 +64,6 @@ you reach for the keyboard).
 | Open palm + horizontal sweep | **Alt+Tab** forward / back |
 | Open palm, pinky-side leading, sweep up | **Volume up** |
 | Open palm, thumb-side leading, sweep down | **Volume down** |
-
----
-## Demo
-
-A short recording of the gesture set from the table above, run on a live
-webcam feed.
-
-https://github.com/user-attachments/assets/e2745aa1-b07b-4ebb-8d34-1daf894f0c5f
 
 ---
 
