@@ -1,0 +1,17 @@
+# virtualenv / caches
+.venv/
+__pycache__/
+*.pyc
+
+# MediaPipe model - downloaded automatically on first run (see landmarks.py)
+hand_landmarker.task
+
+# runtime artifacts
+telemetry.csv
+debug_frames/
+recording_*.mp4
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
