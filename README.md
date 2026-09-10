@@ -154,9 +154,3 @@ config.py          all tunable thresholds
 perf_logger.py     buffered CSV telemetry
 requirements.txt
 ```
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
