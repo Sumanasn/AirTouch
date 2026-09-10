@@ -9,15 +9,16 @@ dropping dispatch on every frame the label didn't match whichever one had
 last claimed "active".
 
 Mapping (priority top to bottom). Ring/pinky aren't checked for these poses
-directly (tendon linkage makes them flicker) - only open_palm/is_fist rely
-on all 5 via n_extended:
+directly (tendon linkage makes them flicker) - open_palm gates on n_extended
+across all 5; the fist ignores the thumb (its curl reading is unreliable):
   - thumb+index touched down together, close in XY: grab -> drag
   - index+middle extended: scroll, direction from hand tilt
-  - fist (all curled): toggle play/pause
+  - fist (index/middle/ring/pinky curled): toggle play/pause
   - index extended, middle not: "point" - moves the cursor; index
-    z-push/retract fires tap/double-tap, a traced checkmark stroke fires
-    zoom-in, thumb-index pinch_ratio fires zoom-out - all concurrent with
-    pointing rather than separate exclusive poses
+    z-push/retract fires tap/double-tap, a traced index checkmark stroke
+    (with the thumb also extended) fires zoom-in, thumb-index pinch_ratio
+    fires zoom-out - all concurrent with pointing rather than separate
+    exclusive poses
   - 4-or-5 fingers, released quickly: play/pause (global)
   - 4-or-5 fingers held ~0.7s: toggle tracking on/off (global)
   - 4-or-5 fingers + fast horizontal slide: Alt+Tab (global). Volume =
@@ -52,10 +53,12 @@ class HandState:
         self.palm_hold_start = None
         self.palm_hold_pos = (0.0, 0.0)
         self.palm_moved = False
+        self.palm_stroke_axis = None  # None | "h" (swipe) | "v" (volume) while a stroke is committed
         self.all_five = False
         self.scroll_count = 0
         self.last_cursor_pos = None
         self.fist_active = False
+        self.fist_count = 0
         self.last_volume_tick = -999.0
 
 
@@ -165,28 +168,42 @@ class GestureStateMachine:
         if self.tracking_enabled:
             pcx, pcy = prev_lm[config.WRIST, :2]
             vx, vy = (cx - pcx) / dt, (cy - pcy) / dt
+            speed = (vx * vx + vy * vy) ** 0.5
 
+            # Commit each open-palm stroke to one axis so a swipe can't also
+            # move volume and vice versa: when the palm starts moving from
+            # rest, lock onto whichever axis clearly dominates and hold that
+            # until the hand settles. A diagonal (neither axis dominant)
+            # commits to nothing.
+            if st.palm_stroke_axis is None and speed > config.PALM_STROKE_MIN_SPEED:
+                if abs(vx) > abs(vy) * config.PALM_STROKE_AXIS_RATIO:
+                    st.palm_stroke_axis = "h"
+                elif abs(vy) > abs(vx) * config.PALM_STROKE_AXIS_RATIO:
+                    st.palm_stroke_axis = "v"
+            elif speed < config.SWIPE_SETTLE_SPEED:
+                st.palm_stroke_axis = None
+
+            # feed the swipe detector every frame so its cooldown/settle
+            # state stays coherent, but only act on a committed horizontal
             direction = st.swipe.update(vx, vy, t)
-            if direction == "left":
-                actions.alt_tab_prev()
-            elif direction == "right":
-                actions.alt_tab_next()
+            if st.palm_stroke_axis == "h":
+                if direction == "left":
+                    actions.alt_tab_prev()
+                elif direction == "right":
+                    actions.alt_tab_next()
 
-            # Volume = vertical hand motion qualified by hand orientation,
-            # so the return stroke is ignored: move UP with the pinky on
-            # the left = louder, move DOWN with the thumb on the left =
-            # quieter. After a volume-up sweep the hand is still pinky-left,
-            # so bringing it back down doesn't match volume-down (which
-            # needs thumb-left) - you ratchet up without rotating. A still
-            # palm has ~zero vy so it never drifts; abs(vy) > abs(vx) keeps
-            # a horizontal alt-tab swipe out of it.
+            # Volume: a committed vertical stroke, qualified by orientation
+            # so the return stroke is ignored - move UP pinky-left = louder,
+            # DOWN thumb-left = quieter. After a volume-up sweep the hand is
+            # still pinky-left, so lowering it doesn't match volume-down;
+            # you ratchet up without rotating.
             thumb_x = lm[config.THUMB_TIP, 0]
             pinky_x = lm[config.PINKY_TIP, 0]
             thumb_left = thumb_x < pinky_x - config.VOLUME_ORIENT_MARGIN
             pinky_left = pinky_x < thumb_x - config.VOLUME_ORIENT_MARGIN
             if (
-                abs(vy) > config.VOLUME_MOVE_SPEED
-                and abs(vy) > abs(vx)
+                st.palm_stroke_axis == "v"
+                and abs(vy) > config.VOLUME_MOVE_SPEED
                 and t - st.last_volume_tick > config.VOLUME_TICK_COOLDOWN_S
             ):
                 if vy < 0 and pinky_left:      # moving up, image y decreases upward
@@ -219,12 +236,18 @@ class GestureStateMachine:
         checkmark_event = st.checkmark.update(float(raw_ix), float(raw_iy), t)
 
         n_extended = sum(extended.values())
+        non_thumb_extended = n_extended - (1 if extended["thumb"] else 0)
         open_palm = n_extended >= 4
-        is_fist = (not grab) and n_extended == 0
 
-        # Ring/pinky aren't checked directly here (tendon linkage makes them
-        # flicker) - open_palm/is_fist still catch genuine all-extended/
-        # all-curled cases via n_extended.
+        # Thumb curl detection is unreliable (short 2D segment) - a real
+        # fist frequently still reads the thumb as extended (telemetry:
+        # 1286 frames of thumb-only-extended while making a fist), so judge
+        # the fist by the other four fingers and debounce it like scroll so
+        # a relaxing hand doesn't flicker a play/pause.
+        fist_pose = (not grab) and non_thumb_extended == 0
+        st.fist_count = min(st.fist_count + 1, config.MODE_DEBOUNCE_FRAMES) if fist_pose else 0
+        is_fist = st.fist_count >= config.MODE_DEBOUNCE_FRAMES
+
         index_up = extended["index"]
         middle_up = extended["middle"]
 
@@ -284,7 +307,11 @@ class GestureStateMachine:
                 actions.click()
             st.last_tap = t
 
-        if not grab and index_up and checkmark_event == "in":
+        # thumb must be extended too - the checkmark is traced with the
+        # index, but requiring the thumb out makes it a deliberate "L-ish"
+        # hand shape so a stray index flick with the thumb tucked can't
+        # trigger a zoom
+        if not grab and index_up and extended["thumb"] and checkmark_event == "in":
             actions.zoom_in()
 
         self.last_telemetry = {

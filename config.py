@@ -33,13 +33,12 @@ TRACKING_CONFIDENCE = 0.5
 
 # Virtual-touch: each fingertip is a Schmitt trigger on z-velocity (push
 # toward the camera = "down"). The velocity is a One-Euro filter's own
-# internal derivative on the raw z-position, not a raw frame-diff smoothed
-# afterward - filtering before differentiating is cleaner and the filter's
-# time-aware smoothing replaces the dt-floor hack unstable frame timing
-# used to need. Uncalibrated for this signal - retune from telemetry.
+# internal derivative on the raw z-position. Only D_CUTOFF actually shapes
+# that velocity signal (MIN_CUTOFF/BETA tune the filtered position, which
+# FingerTouch discards) - retune D_CUTOFF from telemetry.
 Z_ONE_EURO_MIN_CUTOFF = 1.0
 Z_ONE_EURO_BETA = 0.3
-Z_ONE_EURO_D_CUTOFF = 1.8
+Z_ONE_EURO_D_CUTOFF = 1.2
 # Tightened from -1.8: telemetry showed ordinary jitter while pointing
 # crossed -1.8 often enough to trigger false downs that then lingered for
 # 5-48s (real taps retract fast; these didn't) until an unrelated motion
@@ -91,7 +90,7 @@ FINGER_CURL_RATIO = {"thumb": 0.75, "index": 0.9, "middle": 0.9, "ring": 1.15, "
 
 # A candidate pose must hold this many consecutive frames before it's
 # acted on, so a boundary-frame flicker can't fire the wrong action.
-MODE_DEBOUNCE_FRAMES = 3
+MODE_DEBOUNCE_FRAMES = 6
 
 # Scroll: hand orientation sets direction, not position delta - a fixed
 # tick every held frame reads smoother than a jittery position-delta would.
@@ -110,10 +109,16 @@ PALM_QUICK_OPEN_MIN_S = 0.1  # below this = noise, not a deliberate quick-open f
 # enough that ordinary hold jitter (measured from a fixed anchor) stays
 # well under it; a real sweep (~0.2-0.4) blows past it instantly.
 PALM_HOLD_MAX_DRIFT = 0.13
+# An open-palm stroke commits to one axis (swipe vs. volume) once its speed
+# passes MIN and one axis dominates the other by AXIS_RATIO; it releases
+# when speed drops below SWIPE_SETTLE_SPEED. Keeps a swipe's slight vertical
+# wobble from also nudging volume, and a volume sweep's drift from swiping.
+PALM_STROKE_MIN_SPEED = 0.4
+PALM_STROKE_AXIS_RATIO = 1.5
 SWIPE_MIN_SPEED = 0.6
 SWIPE_MAX_CROSS_DRIFT = 0.35  # rejects a diagonal move that isn't clean along one axis
 SWIPE_COOLDOWN_S = 0.35
-SWIPE_SETTLE_SPEED = 0.3  # below this = hand has stopped, an opposite-direction swipe can fire again
+SWIPE_SETTLE_SPEED = 0.3  # below this = hand has stopped; also releases the stroke-axis commit
 
 # Volume = vertical hand motion qualified by orientation: move UP with the
 # pinky on the left = louder, move DOWN with the thumb on the left =
