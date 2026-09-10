@@ -19,11 +19,13 @@ from perf_logger import PerfLogger
 HAND_COLORS = {"Left": (255, 140, 0), "Right": (0, 200, 255)}
 DEBUG_FRAMES_DIR = "debug_frames"
 
-# Mean per-coordinate landmark motion (normalized) below this = the feed is
-# frozen. A live hand even "held still" jitters ~0.003-0.01 from real
-# micro-motion plus MediaPipe noise; a frozen webcam frame moves ~1e-4.
-# Exact-equality checks miss it because 1-bit pixel noise on the frozen
-# frame perturbs the landmarks by ~1e-6.
+# Mean per-coordinate XY landmark motion (normalized) below this = the feed
+# is frozen. Deliberately excludes Z: it's MediaPipe's noisiest axis, and
+# a telemetry-confirmed freeze (X/Y/finger-ratios all bit-identical for
+# 1000+ frames) still never tripped this check when Z was included - likely
+# XNNPACK's multi-threaded inference isn't bit-reproducible run-to-run even
+# on an unchanged input, and that noise lives mostly in Z. A live hand even
+# "held still" jitters X/Y more than a frozen feed's residual noise.
 _FROZEN_LANDMARK_DELTA = 0.0008
 _FROZEN_FRAMES_BEFORE_REOPEN = 30
 
@@ -101,7 +103,7 @@ def main():
             cam_read_ms = (time.perf_counter() - t0) * 1000
             if frame is None:
                 if cam.disconnected:
-                    print("Webcam disconnected, exiting.")
+                    print("Webcam disconnected, exiting.", flush=True)
                     break
                 continue  # hasn't produced its first frame yet - transient, keep polling
             frame = cv2.flip(frame, 1)  # mirror for natural interaction
@@ -111,16 +113,19 @@ def main():
             hands = tracker.process(frame_rgb)
             inference_ms = (time.perf_counter() - t1) * 1000
 
-            # A frozen feed shows near-zero landmark motion frame-to-frame;
+            # A frozen feed shows near-zero XY landmark motion frame-to-frame;
             # a live hand always jitters more. A run of near-still frames
             # means the camera has stalled - reopen it, and drop this frame
-            # so a stale pose can't drive input.
+            # so a stale pose can't drive input. XY only (see the constant's
+            # comment) - Z is excluded, not just de-weighted.
+            landmark_delta = None
             if hands and prev_landmarks is not None:
-                delta = float(np.abs(hands[0].landmarks - prev_landmarks).mean())
+                delta = float(np.abs(hands[0].landmarks[:, :2] - prev_landmarks[:, :2]).mean())
+                landmark_delta = delta
                 if delta < _FROZEN_LANDMARK_DELTA:
                     frozen_frames += 1
                     if frozen_frames >= _FROZEN_FRAMES_BEFORE_REOPEN:
-                        print(f"Webcam feed frozen (landmark delta {delta:.6f}), reopening...")
+                        print(f"Webcam feed frozen (landmark delta {delta:.6f}), reopening...", flush=True)
                         cam.request_reopen()
                         frozen_frames = 0
                         prev_landmarks = None
@@ -162,6 +167,7 @@ def main():
                 dispatch_ms=round(dispatch_ms, 2),
                 fps=round(fps, 1),
                 hand_detected=bool(hands),
+                landmark_delta=round(landmark_delta, 6) if landmark_delta is not None else "",
                 **telem,
             )
 

@@ -2,7 +2,7 @@
 screen when it pushes toward the camera fast enough (scale-invariant
 z-velocity - the same trigger idea as touching real glass), and 'lifts' on
 the matching retract. Level-triggered, not a single pulse, so a brief
-down-then-up reads as a tap while a held-down finger drives drag/scroll.
+down-then-up reads as a tap while a held-down finger drives drag.
 """
 import numpy as np
 
@@ -129,7 +129,7 @@ class FingerTouch:
 class SwipeDetector:
     """Fires 'left'/'right' when the wrist moves fast and cleanly along the
     horizontal axis - used for the 4/5-finger slide (Alt+Tab). Vertical
-    motion isn't handled here; see the rotation-based volume control
+    motion isn't handled here; see state_machine.py's volume handling
     instead, since a lift/lower swipe would have the same "return stroke"
     problem this detector guards against, but worse.
 

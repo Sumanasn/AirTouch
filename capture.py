@@ -14,8 +14,9 @@ _MAX_CONSECUTIVE_READ_FAILURES = 30  # ~1s of failed reads = treat as disconnect
 # while still reporting ok=True. Frame-pixel checks (exact or near-equal)
 # proved unreliable at spotting it - the frozen scene still carries enough
 # sensor/transport noise to look "different". So the freeze is detected one
-# level up, in main.py, off byte-identical MediaPipe landmarks (which a
-# live camera never produces), and signalled back here via request_reopen().
+# level up, in main.py, off near-still MediaPipe XY landmarks (a live hand
+# jitters more than that even held still), and signalled back here via
+# request_reopen().
 
 
 class ThreadedCamera:
@@ -31,11 +32,13 @@ class ThreadedCamera:
 
     def request_reopen(self):
         """Ask the capture thread to release and reopen the device - called
-        by main.py when it sees a frozen feed (identical landmarks)."""
+        by main.py when it sees a frozen feed (near-still landmarks)."""
         self._reopen_requested = True
 
     @staticmethod
     def _open_capture():
+        # if this raises "Could not open webcam" on macOS/Linux, the fix is
+        # config.CAMERA_BACKEND (Windows-only DirectShow) - see its comment
         cap = cv2.VideoCapture(config.CAMERA_INDEX, config.CAMERA_BACKEND)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*config.CAMERA_FOURCC))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
@@ -58,11 +61,11 @@ class ThreadedCamera:
         while self._running:
             if self._reopen_requested:
                 self._reopen_requested = False
-                print("Webcam feed frozen (identical landmarks), reopening capture...")
+                print("Webcam feed frozen, reopening capture...", flush=True)
                 if self._try_reopen():
-                    print("Webcam capture reopened.")
+                    print("Webcam capture reopened.", flush=True)
                 else:
-                    print("Webcam reopen failed, giving up.")
+                    print("Webcam reopen failed, giving up.", flush=True)
                     with self._lock:
                         self._frame = None
                     self.disconnected = True

@@ -27,7 +27,7 @@ across all 5; the fist ignores the thumb (its curl reading is unreliable):
     stroke a no-op); only ticks while moving.
 
 Active/inactive is presence-based: becomes active the moment a hand is
-seen, and releases after DRIVING_HAND_RELEASE_S unseen.
+seen, and releases after HAND_RELEASE_S unseen.
 """
 import config
 import actions
@@ -119,7 +119,7 @@ class GestureStateMachine:
     def end_frame(self, t):
         if not self.active:
             return
-        if t - self._state.last_seen_t > config.DRIVING_HAND_RELEASE_S:
+        if t - self._state.last_seen_t > config.HAND_RELEASE_S:
             self._end_drag_if_active()
             self.active = False
 

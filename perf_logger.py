@@ -11,7 +11,7 @@ FLUSH_EVERY = 60
 
 _HEADERS = (
     "timestamp_ms", "frame_ms", "cam_read_ms", "inference_ms", "dispatch_ms",
-    "fps", "hand_detected", "raw_x", "raw_y", "screen_x", "screen_y",
+    "fps", "hand_detected", "landmark_delta", "raw_x", "raw_y", "screen_x", "screen_y",
     "candidate_pose", "active_state", "thumb_extended", "thumb_ratio",
     "index_extended", "middle_extended",
     "index_ratio", "middle_ratio", "fingers_down", "thumb_zvel", "index_zvel",

@@ -22,7 +22,13 @@ PINKY_MID = 10
 
 # Webcam capture - tuned for latency, not image quality
 CAMERA_INDEX = 0
-CAMERA_BACKEND = cv2.CAP_DSHOW  # bypasses the heavier Media Foundation wrapper
+# WINDOWS-ONLY VALUE - the #1 thing to change to run this on another OS.
+# DirectShow doesn't exist outside Windows; cv2.VideoCapture(index, backend)
+# will fail to open the camera at all with this set on macOS/Linux. Swap
+# for cv2.CAP_AVFOUNDATION on macOS, cv2.CAP_V4L2 on Linux, or cv2.CAP_ANY
+# to let OpenCV auto-pick (simplest, but loses the "bypass the heavier
+# wrapper" latency win this specific backend was chosen for on Windows).
+CAMERA_BACKEND = cv2.CAP_DSHOW
 CAMERA_WIDTH = 320
 CAMERA_HEIGHT = 240
 CAMERA_FOURCC = "MJPG"  # most webcams cap at 30fps on YUY2; MJPG unlocks 60fps
@@ -97,7 +103,7 @@ MODE_DEBOUNCE_FRAMES = 6
 SCROLL_STEP = 2
 SCROLL_ORIENTATION_DEADBAND = 0.03  # normalized wrist-to-fingertip vertical gap
 
-DRIVING_HAND_RELEASE_S = 0.3  # either hand can drive; one at a time
+HAND_RELEASE_S = 0.3  # hand goes "inactive" after this long unseen
 
 # 4-or-5-finger hold (toggle tracking) vs. horizontal slide (prev/next
 # track) vs. vertical move (volume, see below). Not calibrated against logs.
