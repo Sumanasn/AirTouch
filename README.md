@@ -11,13 +11,6 @@ against real data instead of guesswork.
 
 ---
 
-## Demo
-
-<!-- Drop a screen recording here, e.g. docs/demo.mp4 or a GIF -->
-_Add your screen recording here._
-
----
-
 ## Gesture vocabulary
 
 Tracking starts **OFF**. Hold an open palm still for ~0.7 s to toggle it on
