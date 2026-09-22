@@ -85,9 +85,13 @@ class FingerTouch:
         self.down_since = 0.0
         self.down_pos = (0.0, 0.0)
         self.max_travel = 0.0
-        self.velocity = 0.0  # last filtered z-velocity, kept for telemetry/calibration
+        self.max_xy_speed = 0.0
+        self.velocity = 0.0  # last filtered z-velocity, kept for telemetry
         self.last_dwell = 0.0   # dwell/travel of the most recently resolved down->up cycle,
         self.last_travel = 0.0  # kept for telemetry so we can see why a cycle became "up" not "tap"
+        self.last_max_xy_speed = 0.0  # peak on-screen (x,y) speed during that cycle - see TAP_FAST_MIN_SPEED
+        self._prev_xy = None
+        self._prev_t = None
         self._z_filter = OneEuroFilter(
             config.Z_ONE_EURO_MIN_CUTOFF, config.Z_ONE_EURO_BETA, config.Z_ONE_EURO_D_CUTOFF
         )
@@ -103,22 +107,40 @@ class FingerTouch:
         x, y = landmarks[tip_idx, :2]
         event = None
 
+        if self._prev_xy is not None:
+            pdt = max(t - self._prev_t, 1e-6)
+            xy_speed = float(np.hypot(x - self._prev_xy[0], y - self._prev_xy[1])) / pdt
+        else:
+            xy_speed = 0.0
+        self._prev_xy, self._prev_t = (float(x), float(y)), t
+
         if not self.down:
             if vel < config.TOUCH_DOWN_VELOCITY:
                 self.down = True
                 self.down_since = t
                 self.down_pos = (float(x), float(y))
                 self.max_travel = 0.0
+                self.max_xy_speed = xy_speed
                 event = "down"
         else:
             travel = float(np.hypot(x - self.down_pos[0], y - self.down_pos[1]))
             self.max_travel = max(self.max_travel, travel)
-            if vel > config.TOUCH_UP_VELOCITY:
+            self.max_xy_speed = max(self.max_xy_speed, xy_speed)
+            dwell = t - self.down_since
+            # a genuine lift (fast retraction) OR a hard timeout, so a
+            # false/stray down - or a real but slow retraction - can't
+            # linger indefinitely. The timeout path is never a "tap".
+            if vel > config.TOUCH_UP_VELOCITY or dwell > config.TOUCH_STUCK_TIMEOUT_S:
                 self.down = False
-                dwell = t - self.down_since
                 self.last_dwell = dwell
                 self.last_travel = self.max_travel
-                if dwell < config.TAP_MAX_DWELL_S and self.max_travel < config.TAP_MAX_TRAVEL:
+                self.last_max_xy_speed = self.max_xy_speed
+                # A tap that qualifies on raw travel is unambiguous. One
+                # that exceeds TAP_MAX_TRAVEL can still count if it moved
+                # fast enough - see TAP_FAST_MIN_SPEED.
+                travel_ok = self.max_travel < config.TAP_MAX_TRAVEL
+                fast_ok = self.max_xy_speed > config.TAP_FAST_MIN_SPEED
+                if dwell < config.TAP_MAX_DWELL_S and (travel_ok or fast_ok):
                     event = "tap"
                 else:
                     event = "up"
@@ -197,33 +219,55 @@ class ZoomDetector:
 
 class CheckmarkDetector:
     """Fires 'in' when the index fingertip traces a checkmark: a short
-    down-stroke immediately followed by a longer up-and-right stroke.
+    down-stroke immediately followed by a longer up-and-right stroke, with
+    the depth (z) staying calm the whole time.
 
-    Keeps a short rolling buffer of (t, x, y) fingertip samples, finds the
-    buffer's lowest point (largest y - image y grows downward) as the
+    Keeps a short rolling buffer of (t, x, y, zvel) fingertip samples, finds
+    the buffer's lowest point (largest y - image y grows downward) as the
     stroke's "elbow" - excluding the buffer's own endpoints, so a straight
     motion can't "elbow" at its own start or end - and checks the two legs
-    on either side of it match a checkmark's shape."""
+    on either side of it match a checkmark's shape.
+
+    The zvel gate exists because reaching the index finger toward the
+    camera - a tap attempt - naturally dips-then-rises on screen too (the
+    wrist flexes as the arm extends), tracing something shape-wise
+    indistinguishable from a real checkmark, without ever pushing toward
+    the camera the way a real checkmark stroke doesn't either. Shape alone
+    (leg lengths, their ratio) turned out not to separate genuine
+    checkmarks from accidental hover-wobble traces either; the zvel cap
+    combined with a minimum stroke speed is what actually worked, at the
+    cost of also rejecting some genuine checkmarks - see CHECKMARK_MAX_ZVEL
+    in config.py for the tradeoff."""
 
     def __init__(self):
-        self.buffer = []  # list of (t, x, y), pruned to CHECKMARK_WINDOW_S
+        self.buffer = []  # list of (t, x, y, zvel), pruned to CHECKMARK_WINDOW_S
         self.last_fire = -999.0
-        # last-evaluated leg lengths, kept for telemetry/calibration even
-        # on frames that don't fire - same idea as FingerTouch's last_dwell
+        # last-evaluated values, kept for telemetry even on frames that
+        # don't fire - same idea as FingerTouch's last_dwell
         self.last_leg1_len = 0.0
         self.last_leg2_len = 0.0
+        self.last_max_zvel = 0.0
+        self.last_stroke_speed = 0.0  # peak frame-to-frame (x,y) speed in the buffered window
 
-    def update(self, x: float, y: float, t: float) -> str | None:
-        self.buffer.append((t, x, y))
+    def update(self, x: float, y: float, zvel: float, t: float) -> str | None:
+        self.buffer.append((t, x, y, zvel))
         cutoff = t - config.CHECKMARK_WINDOW_S
         self.buffer = [s for s in self.buffer if s[0] >= cutoff]
         if len(self.buffer) < 3:
             return None
 
-        _, start_x, start_y = self.buffer[0]
+        _, start_x, start_y, _ = self.buffer[0]
         elbow_i = max(range(1, len(self.buffer) - 1), key=lambda i: self.buffer[i][2])
-        _, elbow_x, elbow_y = self.buffer[elbow_i]
-        _, end_x, end_y = self.buffer[-1]
+        _, elbow_x, elbow_y, _ = self.buffer[elbow_i]
+        _, end_x, end_y, _ = self.buffer[-1]
+        max_zvel = max(abs(s[3]) for s in self.buffer)
+        self.last_max_zvel = max_zvel
+
+        stroke_speed = 0.0
+        for (t1, x1, y1, _), (t2, x2, y2, _) in zip(self.buffer, self.buffer[1:]):
+            pdt = max(t2 - t1, 1e-6)
+            stroke_speed = max(stroke_speed, float(np.hypot(x2 - x1, y2 - y1)) / pdt)
+        self.last_stroke_speed = stroke_speed
 
         leg1_dx, leg1_dy = elbow_x - start_x, elbow_y - start_y
         leg2_dx, leg2_dy = end_x - elbow_x, end_y - elbow_y
@@ -233,6 +277,10 @@ class CheckmarkDetector:
         self.last_leg2_len = leg2_len
 
         if t - self.last_fire < config.CHECKMARK_COOLDOWN_S:
+            return None
+        if max_zvel > config.CHECKMARK_MAX_ZVEL:            # depth wasn't calm - likely a tap, not a trace
+            return None
+        if stroke_speed < config.CHECKMARK_MIN_STROKE_SPEED:  # too slow - likely idle hover wobble
             return None
         if leg1_len < config.CHECKMARK_MIN_LEG1 or leg2_len < config.CHECKMARK_MIN_LEG2:
             return None

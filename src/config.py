@@ -34,8 +34,13 @@ CAMERA_HEIGHT = 240
 CAMERA_FOURCC = "MJPG"  # most webcams cap at 30fps on YUY2; MJPG unlocks 60fps
 
 MAX_HANDS = 1
-DETECTION_CONFIDENCE = 0.6
-TRACKING_CONFIDENCE = 0.5
+# Lowered from 0.6/0.5: hand-detection dropouts (cursor frozen, no hand to
+# drive it) were lasting up to 20s+ during ordinary pointing. These gate
+# how easily MediaPipe gives up on a marginal-confidence hand rather than
+# tracking through it - lower trades some false-positive risk for fewer,
+# shorter dropouts.
+DETECTION_CONFIDENCE = 0.4
+TRACKING_CONFIDENCE = 0.3
 
 # Virtual-touch: each fingertip is a Schmitt trigger on z-velocity (push
 # toward the camera = "down"). The velocity is a One-Euro filter's own
@@ -45,21 +50,28 @@ TRACKING_CONFIDENCE = 0.5
 Z_ONE_EURO_MIN_CUTOFF = 1.0
 Z_ONE_EURO_BETA = 0.3
 Z_ONE_EURO_D_CUTOFF = 1.2
-# Tightened from -1.8: telemetry showed ordinary jitter while pointing
-# crossed -1.8 often enough to trigger false downs that then lingered for
-# 5-48s (real taps retract fast; these didn't) until an unrelated motion
-# happened to cross back over TOUCH_UP_VELOCITY. -2.4 sits above this
-# session's noise ceiling (99.5th percentile -2.65) but well below genuine
-# deliberate pushes (session min -4.86).
+# Tightened from -1.8: ordinary pointing jitter crossed -1.8 often enough
+# to trigger false downs that then lingered for 5-48s. -2.4 sits above
+# normal noise but below genuine deliberate pushes.
 TOUCH_DOWN_VELOCITY = -2.4   # z_norm_velocity below this = finger touches down
 # Loosened from 1.5: a stuck false-down should resolve quickly, not linger
 # for tens of seconds swallowing the next genuine attempt.
 TOUCH_UP_VELOCITY = 1.2      # z_norm_velocity above this while down = lifts
-# Both raised: two genuine fast taps this session (0.43s/0.11 travel,
-# 0.72s/0.15 travel) still missed the old 0.65/0.07 caps by a hair.
+# Both raised: genuine fast taps were still missing the old, tighter caps.
 TAP_MAX_DWELL_S = 0.85
 TAP_MAX_TRAVEL = 0.18        # normalized xy distance; above this = drag, not tap
+# Rescues a tap that exceeds TAP_MAX_TRAVEL if it moved fast enough - see
+# FingerTouch.update(). The travel cap alone was disqualifying more fast,
+# genuine taps than it accepted; a deliberate tap covers more ground than
+# a slow drift/drag covers in the same distance, so speed tells them apart.
+TAP_FAST_MIN_SPEED = 8.0
 DOUBLE_TAP_WINDOW_S = 0.30
+# Hard safety valve: a "down" touch cycle can't linger forever - a
+# false/stray down (or a slow retraction) could otherwise stick for
+# 30-48s waiting to cross TOUCH_UP_VELOCITY. Past this, force-resolve as
+# "up", never "tap" - a clean tap already resolves well inside
+# TAP_MAX_DWELL_S on its own.
+TOUCH_STUCK_TIMEOUT_S = 2.0
 
 # Grab additionally requires thumb+index close in XY - z-touch alone fired
 # from a peace sign, a point, even an open palm. Must stay TIGHTER than
@@ -74,7 +86,13 @@ GRAB_PINCH_RATIO = 0.25
 CURSOR_ACTIVE_X_MIN = 0.22
 CURSOR_ACTIVE_X_MAX = 0.90
 CURSOR_ACTIVE_Y_MIN = 0.40
-CURSOR_ACTIVE_Y_MAX = 0.85
+# Lowered from 0.85: detection reliability collapses well before the frame
+# edge (roughly 77% around y=0.7, down to ~1% by y=0.9 - landmark quality
+# falls apart for a hand that low in frame). 0.85 required reaching into
+# that near-undetectable zone just to hit the bottom of the screen, which
+# read as choppy rather than smooth. 0.75 keeps the reach inside a still-
+# reliable range.
+CURSOR_ACTIVE_Y_MAX = 0.75
 # Runs on mapped pixel coordinates, so these follow Casiez et al.'s own
 # mouse-pointer demo defaults rather than normalized-space-scale values.
 CURSOR_ONE_EURO_MIN_CUTOFF = 1.0
@@ -114,7 +132,11 @@ PALM_QUICK_OPEN_MIN_S = 0.1  # below this = noise, not a deliberate quick-open f
 # the new spot - so a multi-second volume sweep can't flip tracking. Loose
 # enough that ordinary hold jitter (measured from a fixed anchor) stays
 # well under it; a real sweep (~0.2-0.4) blows past it instantly.
-PALM_HOLD_MAX_DRIFT = 0.13
+# Raised from 0.13: that sat right on top of ordinary hold jitter, which
+# kept resetting the toggle a fraction of a second before it would've
+# succeeded (the dominant cause of a slow tracking-on). 0.20 sits above
+# normal jitter but below a genuine swipe/volume movement.
+PALM_HOLD_MAX_DRIFT = 0.20
 # An open-palm stroke commits to one axis (swipe vs. volume) once its speed
 # passes MIN and one axis dominates the other by AXIS_RATIO; it releases
 # when speed drops below SWIPE_SETTLE_SPEED. Keeps a swipe's slight vertical
@@ -153,3 +175,15 @@ CHECKMARK_MIN_UP = 0.02         # second leg's minimum upward movement
 CHECKMARK_MIN_RIGHT = 0.01      # second leg's minimum rightward movement
 CHECKMARK_LEG_RATIO = 1.2       # second leg must be at least this many times longer than the first
 CHECKMARK_COOLDOWN_S = 0.6      # a one-shot stroke, not a held pose
+# Rejects a stroke if the index z-velocity (see TOUCH_DOWN/UP_VELOCITY)
+# spiked past this anywhere in the checkmark's window - a real checkmark
+# trace stays flat in depth; a tap attempt (reaching toward the camera)
+# doesn't, but still wobbles on screen enough to satisfy the shape checks
+# above. Shape alone (leg lengths, their ratio) never reliably separated
+# real checkmarks from accidental hover-wobble misfires; combining this
+# zvel cap with CHECKMARK_MIN_STROKE_SPEED (below) is what worked, though
+# it's a real recall/false-positive tradeoff, not a clean cutoff - tighter
+# blocks more misfires but also rejects more genuine checkmarks. The two
+# gates are only proven as a pair, not individually.
+CHECKMARK_MAX_ZVEL = 0.5
+CHECKMARK_MIN_STROKE_SPEED = 0.454

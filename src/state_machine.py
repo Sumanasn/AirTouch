@@ -18,7 +18,8 @@ across all 5; the fist ignores the thumb (its curl reading is unreliable):
     z-push/retract fires tap/double-tap, a traced index checkmark stroke
     (with the thumb also extended) fires zoom-in, thumb-index pinch_ratio
     fires zoom-out - all concurrent with pointing rather than separate
-    exclusive poses
+    exclusive poses. Tap/zoom-in tolerate a transient pose misread (any
+    non-grab, non-open_palm frame), but not those two unambiguous ones.
   - 4-or-5 fingers, released quickly: play/pause (global)
   - 4-or-5 fingers held ~0.7s: toggle tracking on/off (global)
   - 4-or-5 fingers + fast horizontal slide: Alt+Tab (global). Volume =
@@ -29,6 +30,8 @@ across all 5; the fist ignores the thumb (its curl reading is unreliable):
 Active/inactive is presence-based: becomes active the moment a hand is
 seen, and releases after HAND_RELEASE_S unseen.
 """
+import threading
+
 import config
 import actions
 import gestures
@@ -50,6 +53,7 @@ class HandState:
         self.last_seen_t = -999.0
         self.dragging = False
         self.last_tap = -999.0
+        self.pending_click_timer = None  # deferred single-click, cancelled if a double-tap follows
         self.palm_hold_start = None
         self.palm_hold_pos = (0.0, 0.0)
         self.palm_moved = False
@@ -77,6 +81,15 @@ class GestureStateMachine:
 
     def any_hand_all_five(self):
         return self._state.all_five
+
+    def clear_transient_events(self):
+        """index_touch_event/checkmark_event are one-shot pulses, true only
+        on the frame they fired - but _dispatch (and so last_telemetry)
+        doesn't rebuild on a no-hand frame, so without this they'd keep
+        reading their last value. Call after logging each frame (main.py)."""
+        if self.last_telemetry:
+            self.last_telemetry["index_touch_event"] = ""
+            self.last_telemetry["checkmark_event"] = ""
 
     def process_hand(self, label, landmarks, t):
         st = self._state
@@ -160,7 +173,8 @@ class GestureStateMachine:
         # Uses cumulative drift, not instantaneous speed, so a one-frame
         # jitter spike doesn't keep resetting a genuinely still palm.
         _pdx, _pdy = cx - st.palm_hold_pos[0], cy - st.palm_hold_pos[1]
-        if (_pdx * _pdx + _pdy * _pdy) ** 0.5 > config.PALM_HOLD_MAX_DRIFT:
+        drift = (_pdx * _pdx + _pdy * _pdy) ** 0.5
+        if drift > config.PALM_HOLD_MAX_DRIFT:
             st.palm_hold_start = t
             st.palm_hold_pos = (float(cx), float(cy))
             st.palm_moved = True
@@ -233,7 +247,7 @@ class GestureStateMachine:
         # updated unconditionally, not just while pointing - the buffer
         # needs continuous samples to find its "elbow" regardless of pose
         raw_ix, raw_iy = lm[config.INDEX_TIP, :2]
-        checkmark_event = st.checkmark.update(float(raw_ix), float(raw_iy), t)
+        checkmark_event = st.checkmark.update(float(raw_ix), float(raw_iy), st.touches["index"].velocity, t)
 
         n_extended = sum(extended.values())
         non_thumb_extended = n_extended - (1 if extended["thumb"] else 0)
@@ -296,22 +310,44 @@ class GestureStateMachine:
             # undefined pose can't accidentally act like one that is defined
             st.fist_active = False
 
-        # Tap/checkmark fire regardless of which pose the rest of the hand
+        # Tap/checkmark fire regardless of which POSE the rest of the hand
         # reads as this exact frame - gating them behind "point" specifically
         # silently dropped real events whenever a transient n_extended shift
-        # made that one frame read as something else.
-        if not grab and events["index"] == "tap":
-            if t - st.last_tap < config.DOUBLE_TAP_WINDOW_S:
-                actions.double_click()
+        # made that one frame read as something else. Still exclude grab and
+        # open_palm explicitly, though: a tap/checkmark firing mid volume-
+        # sweep or mid Alt+Tab swipe was a real reported bug, and those two
+        # are unambiguous, not a transient misread.
+        if not grab and not open_palm and events["index"] == "tap":
+            # Deferred single-click: double_click() sends its own complete
+            # two-click sequence, so firing click() on tap 1 and
+            # double_click() on tap 2 sent 3 raw OS clicks for two taps.
+            # Hold the single click until the double-tap window closes;
+            # cancel it if a second tap arrives in time. Click at the
+            # position captured now, not wherever the cursor drifts to by
+            # the time the deferred click fires.
+            tap_pos = st.last_cursor_pos
+            if st.pending_click_timer is not None and t - st.last_tap < config.DOUBLE_TAP_WINDOW_S:
+                st.pending_click_timer.cancel()
+                st.pending_click_timer = None
+                if tap_pos:
+                    actions.double_click(*tap_pos)
+                else:
+                    actions.double_click()
             else:
-                actions.click()
+                timer = threading.Timer(
+                    config.DOUBLE_TAP_WINDOW_S, actions.click,
+                    args=tap_pos if tap_pos else (),
+                )
+                timer.daemon = True
+                timer.start()
+                st.pending_click_timer = timer
             st.last_tap = t
 
         # thumb must be extended too - the checkmark is traced with the
         # index, but requiring the thumb out makes it a deliberate "L-ish"
         # hand shape so a stray index flick with the thumb tucked can't
         # trigger a zoom
-        if not grab and index_up and extended["thumb"] and checkmark_event == "in":
+        if not grab and not open_palm and index_up and extended["thumb"] and checkmark_event == "in":
             actions.zoom_in()
 
         self.last_telemetry = {
@@ -325,10 +361,13 @@ class GestureStateMachine:
             "index_touch_event": events["index"] or "",
             "index_last_dwell": round(st.touches["index"].last_dwell, 3),
             "index_last_travel": round(st.touches["index"].last_travel, 4),
+            "index_max_xy_speed": round(st.touches["index"].last_max_xy_speed, 4),
             "pinch_ratio": round(ratio, 3),
             "checkmark_event": checkmark_event or "",
             "checkmark_leg1": round(st.checkmark.last_leg1_len, 4),
             "checkmark_leg2": round(st.checkmark.last_leg2_len, 4),
+            "checkmark_max_zvel": round(st.checkmark.last_max_zvel, 4),
+            "checkmark_stroke_speed": round(st.checkmark.last_stroke_speed, 4),
             "candidate_pose": "grab" if grab else ("scroll" if pose else ("fist" if is_fist else ("point" if point else ("open_palm" if open_palm else "none")))),
             "active_state": "grab" if grab else ("scroll" if scroll else ("fist" if is_fist else ("point" if point else ("open_palm" if open_palm else "none")))),
             "thumb_extended": extended["thumb"],

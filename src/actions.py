@@ -27,12 +27,15 @@ def move_cursor_absolute(x_px: float, y_px: float):
     pyautogui.moveTo(nx, ny)
 
 
-def click():
-    pyautogui.click()
+def click(x_px: float = None, y_px: float = None):
+    # Explicit position, not "wherever the cursor currently is": click() is
+    # deferred (see state_machine.py) to collapse a double-tap into one OS
+    # double-click, so by the time this fires the cursor has often moved on.
+    pyautogui.click(x=x_px, y=y_px)
 
 
-def double_click():
-    pyautogui.doubleClick()
+def double_click(x_px: float = None, y_px: float = None):
+    pyautogui.doubleClick(x=x_px, y=y_px)
 
 
 def drag_start():

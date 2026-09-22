@@ -177,13 +177,15 @@ This telemetry-first loop is how the current values were chosen.
 
 Working: tracking toggle, point / hover, scroll, grab-drag, fist and
 open-palm play/pause, Alt+Tab, orientation-qualified volume (swipe and
-volume can no longer trigger each other), thumb-gated checkmark zoom-in,
-pinch zoom-out, frozen-feed recovery.
+volume can no longer trigger each other), speed-qualified tap (fast
+motion earns slack on distance), thumb-gated checkmark zoom-in (gated on
+depth staying calm and the stroke moving fast enough), pinch zoom-out,
+frozen-feed recovery.
 
-Being refined: the index-push "tap" (z-depth is MediaPipe's noisiest axis
-and needs more filtering work) and the checkmark zoom-in stroke thresholds.
-Recognition quality depends on even lighting and keeping the whole hand in
-frame, not crowding the lens.
+Being refined: checkmark zoom-in still has a real recall/false-positive
+tradeoff (a deliberate stroke can occasionally not register) rather than a
+clean separation from accidental triggers. Recognition quality depends on
+even lighting and keeping the whole hand in frame, not crowding the lens.
 
 ---
 

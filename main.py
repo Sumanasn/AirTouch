@@ -26,12 +26,11 @@ from logs.debug_frames import save_state_transition_frame
 HAND_COLORS = {"Left": (255, 140, 0), "Right": (0, 200, 255)}
 
 # Mean per-coordinate XY landmark motion (normalized) below this = the feed
-# is frozen. Deliberately excludes Z: it's MediaPipe's noisiest axis, and
-# a telemetry-confirmed freeze (X/Y/finger-ratios all bit-identical for
-# 1000+ frames) still never tripped this check when Z was included - likely
-# XNNPACK's multi-threaded inference isn't bit-reproducible run-to-run even
-# on an unchanged input, and that noise lives mostly in Z. A live hand even
-# "held still" jitters X/Y more than a frozen feed's residual noise.
+# is frozen. Deliberately excludes Z: it's MediaPipe's noisiest axis, and a
+# confirmed freeze still didn't trip this check when Z was included -
+# likely inference isn't bit-reproducible run-to-run even on an unchanged
+# input, and that noise lives mostly in Z. A live hand even "held still"
+# jitters X/Y more than a frozen feed's residual noise.
 _FROZEN_LANDMARK_DELTA = 0.0008
 _FROZEN_FRAMES_BEFORE_REOPEN = 30
 
@@ -152,6 +151,7 @@ def main():
                 landmark_delta=round(landmark_delta, 6) if landmark_delta is not None else "",
                 **telem,
             )
+            sm.clear_transient_events()
 
             if debug:
                 draw_debug(frame, hands, sm, fps, frozen=frozen_frames > 5)

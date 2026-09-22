@@ -15,8 +15,9 @@ _HEADERS = (
     "candidate_pose", "active_state", "thumb_extended", "thumb_ratio",
     "index_extended", "middle_extended",
     "index_ratio", "middle_ratio", "fingers_down", "thumb_zvel", "index_zvel",
-    "index_touch_event", "index_last_dwell", "index_last_travel",
+    "index_touch_event", "index_last_dwell", "index_last_travel", "index_max_xy_speed",
     "pinch_ratio", "checkmark_event", "checkmark_leg1", "checkmark_leg2",
+    "checkmark_max_zvel", "checkmark_stroke_speed",
     "ring_extended", "pinky_extended", "ring_ratio", "pinky_ratio",
 )
 
