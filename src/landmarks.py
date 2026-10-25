@@ -1,8 +1,7 @@
-"""MediaPipe Tasks HandLandmarker wrapper. Extracts only wrist + 5 fingertips
-+ 5 mid-joints (PIP, or IP for the thumb) per hand immediately on read - the
-rest of MediaPipe's 21 landmarks are discarded on the spot, never touched
-downstream. The mid-joints exist solely so gestures.py can tell an extended
-finger from a curled one by the tip/mid-to-wrist distance ratio.
+"""MediaPipe Tasks HandLandmarker wrapper. Each Hand carries all 21
+landmarks twice, both in MediaPipe's own numbering (see gestures.py): as
+normalized image coordinates (all_landmarks - where things are on screen)
+and as metric 3D world coordinates (world - true joint angles).
 
 Runs synchronous VIDEO mode rather than async LIVE_STREAM: LIVE_STREAM
 decouples frame capture from result arrival, which would force the gesture
@@ -32,9 +31,6 @@ _MODEL_URL = (
     "hand_landmarker/float16/latest/hand_landmarker.task"
 )
 
-# MediaPipe's own indices for the 11 points we keep: wrist, 5 fingertips,
-# then 5 mid-joints (thumb IP, others' PIP) in the same finger order
-_RAW_INDICES = (0, 4, 8, 12, 16, 20, 3, 6, 10, 14, 18)
 
 
 def _ensure_model():
@@ -44,11 +40,18 @@ def _ensure_model():
 
 
 class Hand:
-    __slots__ = ("landmarks", "handedness")
+    __slots__ = ("handedness", "world", "all_landmarks")
 
-    def __init__(self, landmarks: np.ndarray, handedness: str):
-        self.landmarks = landmarks  # (11, 3): wrist, 5 tips, 5 mid-joints (thumb..pinky order)
+    def __init__(self, handedness: str, world: np.ndarray, all_landmarks: np.ndarray):
         self.handedness = handedness  # "Left" or "Right"
+        # (21, 3) metric 3D, MediaPipe numbering. Joint angles come from
+        # these, not the image points: angles from image-space points are
+        # distorted by perspective - the same bend reads differently
+        # depending on how the finger is angled toward the camera.
+        self.world = world
+        # (21, 3) normalized image coordinates, MediaPipe numbering - for
+        # anything about where the hand is on screen (size, rotation, overlay)
+        self.all_landmarks = all_landmarks
 
 
 class HandTracker:
@@ -79,13 +82,13 @@ class HandTracker:
         hands = []
         if not result.hand_landmarks:
             return hands
-        for lm_set, handedness in zip(result.hand_landmarks, result.handedness):
-            pts = np.array(
-                [(lm_set[i].x, lm_set[i].y, lm_set[i].z) for i in _RAW_INDICES],
-                dtype=np.float32,
-            )
+        for lm_set, world_set, handedness in zip(
+            result.hand_landmarks, result.hand_world_landmarks, result.handedness
+        ):
+            all_pts = np.array([(p.x, p.y, p.z) for p in lm_set], dtype=np.float32)
+            world = np.array([(p.x, p.y, p.z) for p in world_set], dtype=np.float32)
             label = handedness[0].category_name  # "Left" or "Right"
-            hands.append(Hand(pts, label))
+            hands.append(Hand(label, world, all_pts))
         return hands
 
     def close(self):

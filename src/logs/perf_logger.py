@@ -9,27 +9,24 @@ import time
 
 FLUSH_EVERY = 60
 
-_HEADERS = (
+# Frame-level columns main.py fills; everything gesture-related comes from
+# the state machine (GestureStateMachine.telemetry_fields(), which includes
+# each pose plugin's own columns) and is passed in as extra_headers.
+BASE_HEADERS = (
     "timestamp_ms", "frame_ms", "cam_read_ms", "inference_ms", "dispatch_ms",
-    "fps", "hand_detected", "landmark_delta", "raw_x", "raw_y", "screen_x", "screen_y",
-    "candidate_pose", "active_state", "thumb_extended", "thumb_ratio",
-    "index_extended", "middle_extended",
-    "index_ratio", "middle_ratio", "fingers_down", "thumb_zvel", "index_zvel",
-    "index_touch_event", "index_last_dwell", "index_last_travel", "index_max_xy_speed",
-    "pinch_ratio", "checkmark_event", "checkmark_leg1", "checkmark_leg2",
-    "checkmark_max_zvel", "checkmark_stroke_speed",
-    "ring_extended", "pinky_extended", "ring_ratio", "pinky_ratio",
+    "fps", "hand_detected", "landmark_delta",
 )
 
 
 class PerfLogger:
-    def __init__(self, filename="telemetry.csv"):
+    def __init__(self, filename="telemetry.csv", extra_headers=()):
         self.filename = filename
+        self.headers = list(BASE_HEADERS) + [h for h in extra_headers if h not in BASE_HEADERS]
         self.buffer = []
         self.start_time = time.perf_counter()
         self._write_lock = threading.Lock()  # guards against two flush threads overlapping mid-write
         with open(self.filename, mode="w", newline="") as f:
-            csv.writer(f).writerow(_HEADERS)
+            csv.writer(f).writerow(self.headers)
 
     def log_frame(self, **kwargs):
         # accept a caller-supplied timestamp so a saved debug frame (see
@@ -39,7 +36,7 @@ class PerfLogger:
         if ts is None:
             ts = round((time.perf_counter() - self.start_time) * 1000, 2)
         row = [ts]
-        row += [kwargs.get(h, "") for h in _HEADERS[1:]]
+        row += [kwargs.get(h, "") for h in self.headers[1:]]
         self.buffer.append(row)
         if len(self.buffer) >= FLUSH_EVERY:
             self.flush()

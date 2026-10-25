@@ -1,409 +1,192 @@
-"""Single-hand gesture tracking and action dispatch, built on gestures.py's
-per-finger virtual-touch primitives. Tracks one hand at a time (config.
-MAX_HANDS=1) and deliberately ignores MediaPipe's own Left/Right handedness
-label for state-keying purposes - that label can flicker frame-to-frame for
-the same physical hand (worse on a mirrored feed, see main.py's cv2.flip),
-and splitting state by label used to fragment a single continuous gesture
-across two independent, unsynchronized FingerTouch/filter objects, silently
-dropping dispatch on every frame the label didn't match whichever one had
-last claimed "active".
+"""Single-hand gesture recognition and action dispatch - the host for the
+pose plugins in poses/. Tracks one hand at a time (config.MAX_HANDS=1) and
+deliberately ignores MediaPipe's own Left/Right handedness label for
+state-keying - that label can flicker frame-to-frame for the same physical
+hand (worse on a mirrored feed, see main.py's cv2.flip), and splitting state
+by label used to fragment one continuous gesture across two unsynchronized
+sets of filters.
 
-Mapping (priority top to bottom). Ring/pinky aren't checked for these poses
-directly (tendon linkage makes them flicker) - open_palm gates on n_extended
-across all 5; the fist ignores the thumb (its curl reading is unreliable):
-  - thumb+index touched down together, close in XY: grab -> drag
-  - index+middle extended: scroll, direction from hand tilt
-  - fist (index/middle/ring/pinky curled): toggle play/pause
-  - index extended, middle not: "point" - moves the cursor; index
-    z-push/retract fires tap/double-tap, a traced index checkmark stroke
-    (with the thumb also extended) fires zoom-in, thumb-index pinch_ratio
-    fires zoom-out - all concurrent with pointing rather than separate
-    exclusive poses. Tap/zoom-in tolerate a transient pose misread (any
-    non-grab, non-open_palm frame), but not those two unambiguous ones.
-  - 4-or-5 fingers, released quickly: play/pause (global)
-  - 4-or-5 fingers held ~0.7s: toggle tracking on/off (global)
-  - 4-or-5 fingers + fast horizontal slide: Alt+Tab (global). Volume =
-    vertical motion qualified by orientation: move up pinky-left = louder,
-    move down thumb-left = quieter (the orientation makes the return
-    stroke a no-op); only ticks while moving.
+Per frame: every finger gets a 0..1 extension score (gestures.
+FingerExtension); every loaded pose scores its own confidence from those;
+gestures.PoseClassifier picks the most confident one (smoothed, with a
+minimum and a switch margin) or "none". The chosen pose gets on_enter /
+update / on_exit; every pose's observe() runs every frame. What each pose
+does lives in its own file - see poses/ and poses/base.py.
 
-Active/inactive is presence-based: becomes active the moment a hand is
-seen, and releases after HAND_RELEASE_S unseen.
+Not a pose, so handled here: all five fingertips drawing together, from any
+pose -> window overview.
+
+Tracking is always on. Active is presence-based: active the moment a hand is
+seen, inactive after HAND_RELEASE_S unseen.
 """
-import threading
+from collections import deque
 
 import config
 import actions
 import gestures
-from filters import OneEuroFilter2D
-
-
-class HandState:
-    def __init__(self):
-        self.touches = {name: gestures.FingerTouch(name) for name in gestures.FINGER_NAMES}
-        self.exts = {name: gestures.FingerExtension(name) for name in gestures.FINGER_NAMES}
-        self.swipe = gestures.SwipeDetector()
-        self.zoom = gestures.ZoomDetector()
-        self.checkmark = gestures.CheckmarkDetector()
-        self.cursor_filter = OneEuroFilter2D(
-            config.CURSOR_ONE_EURO_MIN_CUTOFF, config.CURSOR_ONE_EURO_BETA, config.CURSOR_ONE_EURO_D_CUTOFF
-        )
-        self.prev_landmarks = None
-        self.prev_t = None
-        self.last_seen_t = -999.0
-        self.dragging = False
-        self.last_tap = -999.0
-        self.pending_click_timer = None  # deferred single-click, cancelled if a double-tap follows
-        self.palm_hold_start = None
-        self.palm_hold_pos = (0.0, 0.0)
-        self.palm_moved = False
-        self.palm_stroke_axis = None  # None | "h" (swipe) | "v" (volume) while a stroke is committed
-        self.all_five = False
-        self.scroll_count = 0
-        self.last_cursor_pos = None
-        self.fist_active = False
-        self.fist_count = 0
-        self.last_volume_tick = -999.0
+import poses
 
 
 class GestureStateMachine:
-    def __init__(self):
-        self.tracking_enabled = False
+    def __init__(self, pose_list=None):
+        self.poses = pose_list if pose_list is not None else poses.load_poses()
+        self._by_name = {p.name: p for p in self.poses}
+        # Always on. Only pyautogui's corner failsafe (Windows/macOS) turns
+        # it off - see main.py.
+        self.tracking_enabled = True
         self.active = False
         self.last_handedness = None  # most recent frame's label, display-only
-        self._state = HandState()
-        self._screen_w, self._screen_h = actions._screen_w, actions._screen_h
-        self.last_telemetry = {}  # populated by _dispatch each frame it runs; see perf_logger.py
+        self.exts = {name: gestures.FingerExtension(name) for name in gestures.FINGER_NAMES}
+        self.classifier = gestures.PoseClassifier(self.poses)
+        self.bunch = gestures.BunchDetector()
+        self._pose = "none"
+        # the last few frames' chosen poses, oldest first - lets a gesture be
+        # judged by the pose from just before it began (see poses/point.py)
+        self.pose_history = deque(maxlen=config.FLEX_LOOKBACK_FRAMES + 1)
+        self._prev_img = None
+        self._prev_t = None
+        self._last_seen_t = -999.0
+        self.last_telemetry = {}  # rebuilt every processed frame; see perf_logger.py
+        self.last_action = None  # (t, label) of the last action sent - display-only feedback
+        self._frame_actions = []  # labels fired this frame, for telemetry
 
-    def fingers_down(self):
-        st = self._state
-        return [n for n in gestures.FINGER_NAMES if st.touches[n].down]
+    # --- services for poses (see poses/base.Pose) -------------------------
 
-    def any_hand_all_five(self):
-        return self._state.all_five
+    def pose(self):
+        """Name of the currently chosen pose, or "none"."""
+        return self._pose
+
+    def fire(self, t, label, fn, *args):
+        """Run an OS action, with overlay flash, telemetry and console feedback."""
+        fn(*args)
+        self.last_action = (t, label)
+        self._frame_actions.append(label)
+        print(label.lower(), flush=True)
+
+    def notify(self, event, t):
+        for p in self.poses:
+            p.on_event(self, event, t)
+
+    def busy(self, t, exclude=None):
+        return any(p.busy(t) for p in self.poses if p is not exclude)
+
+    def cursor_held(self, t, exclude=None):
+        return any(p.holds_cursor(t) for p in self.poses if p is not exclude)
+
+    # --- display-only accessors for main.py's overlay ---------------------
+
+    def pose_color(self, name):
+        p = self._by_name.get(name)
+        return p.color if p else (180, 180, 180)
+
+    def pose_confidences(self):
+        """{pose: smoothed confidence 0..1} - what the classifier chooses on."""
+        return dict(self.classifier.smoothed)
+
+    def fingers_extended(self):
+        return {n: self.exts[n].extended for n in gestures.FINGER_NAMES}
+
+    def finger_values(self):
+        """{finger: bend deg (thumb: spread in palm widths)} - see FingerExtension."""
+        return {n: self.exts[n].value for n in gestures.FINGER_NAMES}
+
+    def tip_spread(self):
+        return self.bunch.spread
+
+    def overlay_lines(self):
+        """[(text, BGR color)] from every pose's overlay()."""
+        return [(line, p.color) for p in self.poses for line in p.overlay(self)]
+
+    # --- telemetry ----------------------------------------------------------
+
+    def telemetry_fields(self):
+        """Every column last_telemetry can fill, for PerfLogger's header."""
+        names = [p.name for p in self.poses]
+        fields = ["handedness", "active_state", "pose_confidence", "action"]
+        fields += [f"conf_{n}" for n in names] + [f"raw_conf_{n}" for n in names]
+        # 0..1 extension score and the raw value it's from (bend deg; thumb:
+        # tip spread in palm widths) per finger - see gestures.FingerExtension
+        fields += [f"{f}_score" for f in gestures.FINGER_NAMES] + [f"{f}_value" for f in gestures.FINGER_NAMES]
+        fields.append("tip_spread")
+        for p in self.poses:
+            fields += [f for f in p.telemetry_fields if f not in fields]
+        return fields
 
     def clear_transient_events(self):
-        """index_touch_event/checkmark_event are one-shot pulses, true only
-        on the frame they fired - but _dispatch (and so last_telemetry)
-        doesn't rebuild on a no-hand frame, so without this they'd keep
-        reading their last value. Call after logging each frame (main.py)."""
+        """One-shot pulses (action, and each pose's transient_fields) are true
+        only on the frame they fired - but last_telemetry doesn't rebuild on
+        a no-hand frame, so without this they'd keep reading their last
+        value. Call after logging each frame (main.py)."""
         if self.last_telemetry:
-            self.last_telemetry["index_touch_event"] = ""
-            self.last_telemetry["checkmark_event"] = ""
+            self.last_telemetry["action"] = ""
+            for p in self.poses:
+                for f in p.transient_fields:
+                    self.last_telemetry[f] = ""
 
-    def process_hand(self, label, landmarks, t):
-        st = self._state
-        st.last_seen_t = t
-        self.last_handedness = label
-        if st.prev_landmarks is None:
-            st.prev_landmarks, st.prev_t = landmarks, t
+    # --- per-frame processing -----------------------------------------------
+
+    def process_hand(self, hand, t):
+        self._last_seen_t = t
+        self.last_handedness = hand.handedness
+        if self._prev_img is None or not self.tracking_enabled:
+            self._prev_img, self._prev_t = hand.all_landmarks, t
             return
+        if not self.active:
+            for p in self.poses:
+                p.on_hand_found(self, t)
+            self.active = True
 
-        dt = max(t - st.prev_t, 1e-6)
-        events = {}
-        down = {}
-        extended = {}
-        for name in gestures.FINGER_NAMES:
-            event, _ = st.touches[name].update(landmarks, t)
-            events[name] = event
-            down[name] = st.touches[name].down
-            extended[name] = st.exts[name].update(landmarks)
-        n_extended = sum(extended.values())
-        st.all_five = n_extended == 5
+        self._frame_actions = []
+        scores = {n: self.exts[n].update(hand.world) for n in gestures.FINGER_NAMES}
+        frame = poses.Frame(
+            t=t, dt=max(t - self._prev_t, 1e-6), hand=hand,
+            prev_img=self._prev_img, scores=scores,
+        )
 
-        # open palm (toggle/swipe/volume) is a pose, not a press - gate on
-        # how many fingers are held extended, not how many are touch-down
-        # (which needs an active push toward the camera on every finger at
-        # once, wrong signal for a gesture that's fundamentally lateral motion)
-        self._handle_open_palm(landmarks, st.prev_landmarks, n_extended, dt, t)
+        prev, new = self._pose, self.classifier.update(frame)
+        if new != prev:
+            if prev in self._by_name:
+                self._by_name[prev].on_exit(self, frame)
+            self._pose = new
+            if new in self._by_name:
+                self._by_name[new].on_enter(self, frame)
+        self.pose_history.append(new)
 
-        if self.tracking_enabled:
-            if not self.active:
-                # becoming active after a gap means the filter's last
-                # position/time are stale - reset so it snaps instead of
-                # gliding from a meaningless dt
-                st.cursor_filter.reset()
-                st.last_cursor_pos = None
-                self.active = True
-            self._dispatch(st, landmarks, down, events, extended, t)
+        # every pose watches every frame first, then the chosen one acts - so
+        # e.g. a click's busy() state is current when the knob checks it
+        for p in self.poses:
+            p.observe(self, frame)
+        if new in self._by_name:
+            self._by_name[new].update(self, frame)
 
-        st.prev_landmarks, st.prev_t = landmarks, t
+        non_thumb = [self.exts[n].value for n in gestures.FINGER_NAMES[1:]]
+        if self.bunch.update(hand.world, sum(non_thumb) / len(non_thumb), t):
+            self.fire(t, "OVERVIEW", actions.show_overview)
+
+        clf = self.classifier
+        telem = {
+            "handedness": hand.handedness,
+            "active_state": new,
+            "pose_confidence": round(clf.confidence, 3),
+            **{f"conf_{k}": round(v, 3) for k, v in clf.smoothed.items()},
+            **{f"raw_conf_{k}": round(v, 3) for k, v in clf.raw.items()},
+            **{f"{n}_score": round(self.exts[n].score, 3) for n in gestures.FINGER_NAMES},
+            **{f"{n}_value": round(self.exts[n].value, 2) for n in gestures.FINGER_NAMES},
+            "tip_spread": round(self.bunch.spread, 3),
+        }
+        for p in self.poses:
+            telem.update(p.telemetry(self, frame))
+        telem["action"] = "+".join(self._frame_actions)
+        self.last_telemetry = telem
+        self._prev_img, self._prev_t = hand.all_landmarks, t
 
     def end_frame(self, t):
-        if not self.active:
-            return
-        if t - self._state.last_seen_t > config.HAND_RELEASE_S:
-            self._end_drag_if_active()
+        if self.active and t - self._last_seen_t > config.HAND_RELEASE_S:
             self.active = False
+            for p in self.poses:
+                p.on_hand_lost(self, t)
 
-    def _end_drag_if_active(self):
-        st = self._state
-        if st.dragging:
-            actions.drag_end()
-            st.dragging = False
-
-    def _handle_open_palm(self, lm, prev_lm, n_extended, dt, t):
-        st = self._state
-        if n_extended < 4:
-            if st.palm_hold_start is not None:
-                # released before the hold-toggle threshold - a quick flash,
-                # not a hold. Same combined play/pause toggle as the fist
-                # gesture (Windows has no separate "play-only" key). Skipped
-                # if the palm moved during the hold - that was a swipe or
-                # volume gesture, not a deliberate quick-open.
-                held_for = t - st.palm_hold_start
-                if (
-                    self.tracking_enabled
-                    and not st.palm_moved
-                    and held_for >= config.PALM_QUICK_OPEN_MIN_S
-                ):
-                    actions.play_pause()
-            st.palm_hold_start = None
-            st.palm_moved = False
-            return
-        cx, cy = lm[config.WRIST, :2]
-        if st.palm_hold_start is None:
-            st.palm_hold_start = t
-            st.palm_hold_pos = (float(cx), float(cy))
-            st.palm_moved = False
-
-        # A palm that has drifted from where it opened is doing a swipe or
-        # volume gesture, not being held still to toggle - restart the hold
-        # from here so a multi-second sweep can't flip tracking mid-gesture.
-        # Uses cumulative drift, not instantaneous speed, so a one-frame
-        # jitter spike doesn't keep resetting a genuinely still palm.
-        _pdx, _pdy = cx - st.palm_hold_pos[0], cy - st.palm_hold_pos[1]
-        drift = (_pdx * _pdx + _pdy * _pdy) ** 0.5
-        if drift > config.PALM_HOLD_MAX_DRIFT:
-            st.palm_hold_start = t
-            st.palm_hold_pos = (float(cx), float(cy))
-            st.palm_moved = True
-
-        if self.tracking_enabled:
-            pcx, pcy = prev_lm[config.WRIST, :2]
-            vx, vy = (cx - pcx) / dt, (cy - pcy) / dt
-            speed = (vx * vx + vy * vy) ** 0.5
-
-            # Commit each open-palm stroke to one axis so a swipe can't also
-            # move volume and vice versa: when the palm starts moving from
-            # rest, lock onto whichever axis clearly dominates and hold that
-            # until the hand settles. A diagonal (neither axis dominant)
-            # commits to nothing.
-            if st.palm_stroke_axis is None and speed > config.PALM_STROKE_MIN_SPEED:
-                if abs(vx) > abs(vy) * config.PALM_STROKE_AXIS_RATIO:
-                    st.palm_stroke_axis = "h"
-                elif abs(vy) > abs(vx) * config.PALM_STROKE_AXIS_RATIO:
-                    st.palm_stroke_axis = "v"
-            elif speed < config.SWIPE_SETTLE_SPEED:
-                st.palm_stroke_axis = None
-
-            # feed the swipe detector every frame so its cooldown/settle
-            # state stays coherent, but only act on a committed horizontal
-            direction = st.swipe.update(vx, vy, t)
-            if st.palm_stroke_axis == "h":
-                if direction == "left":
-                    actions.alt_tab_prev()
-                elif direction == "right":
-                    actions.alt_tab_next()
-
-            # Volume: a committed vertical stroke, qualified by orientation
-            # so the return stroke is ignored - move UP pinky-left = louder,
-            # DOWN thumb-left = quieter. After a volume-up sweep the hand is
-            # still pinky-left, so lowering it doesn't match volume-down;
-            # you ratchet up without rotating.
-            thumb_x = lm[config.THUMB_TIP, 0]
-            pinky_x = lm[config.PINKY_TIP, 0]
-            thumb_left = thumb_x < pinky_x - config.VOLUME_ORIENT_MARGIN
-            pinky_left = pinky_x < thumb_x - config.VOLUME_ORIENT_MARGIN
-            if (
-                st.palm_stroke_axis == "v"
-                and abs(vy) > config.VOLUME_MOVE_SPEED
-                and t - st.last_volume_tick > config.VOLUME_TICK_COOLDOWN_S
-            ):
-                if vy < 0 and pinky_left:      # moving up, image y decreases upward
-                    actions.volume_up()
-                    st.last_volume_tick = t
-                elif vy > 0 and thumb_left:    # moving down
-                    actions.volume_down()
-                    st.last_volume_tick = t
-
-        # the drift check above resets palm_hold_start whenever the palm
-        # moves, so reaching this threshold already means it's been held
-        # still - no extra "did it ever move" latch needed (that latch,
-        # tripped by ordinary hold jitter, was blocking the toggle entirely)
-        if t - st.palm_hold_start > config.FIVE_DOWN_HOLD_TOGGLE_S:
-            self.tracking_enabled = not self.tracking_enabled
-            st.palm_hold_start = None  # consume, don't retrigger every frame
-            if not self.tracking_enabled:
-                self._end_drag_if_active()
-                self.active = False
-
-    def _dispatch(self, st, lm, down, events, extended, t):
-        # z-touch alone fires from a peace sign, a point, even an open palm
-        # (z-depth is MediaPipe's noisiest axis) - requiring thumb+index
-        # close together in XY rules those out.
-        ratio = gestures.pinch_ratio(lm)
-        grab = down["thumb"] and down["index"] and ratio < config.GRAB_PINCH_RATIO
-        # updated unconditionally, not just while pointing - the buffer
-        # needs continuous samples to find its "elbow" regardless of pose
-        raw_ix, raw_iy = lm[config.INDEX_TIP, :2]
-        checkmark_event = st.checkmark.update(float(raw_ix), float(raw_iy), st.touches["index"].velocity, t)
-
-        n_extended = sum(extended.values())
-        non_thumb_extended = n_extended - (1 if extended["thumb"] else 0)
-        open_palm = n_extended >= 4
-
-        # Thumb curl detection is unreliable (short 2D segment) - a real
-        # fist frequently still reads the thumb as extended (telemetry:
-        # 1286 frames of thumb-only-extended while making a fist), so judge
-        # the fist by the other four fingers and debounce it like scroll so
-        # a relaxing hand doesn't flicker a play/pause.
-        fist_pose = (not grab) and non_thumb_extended == 0
-        st.fist_count = min(st.fist_count + 1, config.MODE_DEBOUNCE_FRAMES) if fist_pose else 0
-        is_fist = st.fist_count >= config.MODE_DEBOUNCE_FRAMES
-
-        index_up = extended["index"]
-        middle_up = extended["middle"]
-
-        # Debounced entry, instant exit: a sticky exit would turn ordinary
-        # session-to-session threshold drift into a near-permanent lock.
-        pose = (not grab) and (not open_palm) and index_up and middle_up
-        st.scroll_count = min(st.scroll_count + 1, config.MODE_DEBOUNCE_FRAMES) if pose else 0
-        scroll = st.scroll_count >= config.MODE_DEBOUNCE_FRAMES
-
-        # Merges cursor movement, tap, and zoom into one mode rather than
-        # treating zoom as separate/exclusive - that's what used to freeze
-        # the cursor whenever the pinch ratio drifted near the zoom range.
-        point = (not grab) and (not open_palm) and (not scroll) and index_up and not middle_up
-
-        if grab and not st.dragging:
-            actions.drag_start()
-            st.dragging = True
-        elif not grab and st.dragging:
-            actions.drag_end()
-            st.dragging = False
-
-        screen_pos = None
-        if scroll:
-            wrist_y = lm[config.WRIST, 1]
-            tip_y = (lm[config.INDEX_TIP, 1] + lm[config.MIDDLE_TIP, 1]) / 2
-            if tip_y - wrist_y > config.SCROLL_ORIENTATION_DEADBAND:
-                actions.scroll_vertical(-config.SCROLL_STEP)  # fingers point down
-            elif wrist_y - tip_y > config.SCROLL_ORIENTATION_DEADBAND:
-                actions.scroll_vertical(config.SCROLL_STEP)  # fingers point up
-            st.fist_active = False
-        elif is_fist:
-            if not st.fist_active:
-                actions.play_pause()
-            st.fist_active = True
-        elif grab or point:
-            st.fist_active = False
-            screen_pos = self._move_cursor_absolute(st, lm, t)
-            if point:
-                direction = st.zoom.update(ratio, t)
-                if direction == "out":
-                    actions.zoom_out()
-        else:
-            # open_palm (handled globally in _handle_open_palm) or an
-            # ambiguous hand shape matching no defined fingerprint - a
-            # true no-op rather than defaulting to cursor movement, so an
-            # undefined pose can't accidentally act like one that is defined
-            st.fist_active = False
-
-        # Tap/checkmark fire regardless of which POSE the rest of the hand
-        # reads as this exact frame - gating them behind "point" specifically
-        # silently dropped real events whenever a transient n_extended shift
-        # made that one frame read as something else. Still exclude grab and
-        # open_palm explicitly, though: a tap/checkmark firing mid volume-
-        # sweep or mid Alt+Tab swipe was a real reported bug, and those two
-        # are unambiguous, not a transient misread.
-        if not grab and not open_palm and events["index"] == "tap":
-            # Deferred single-click: double_click() sends its own complete
-            # two-click sequence, so firing click() on tap 1 and
-            # double_click() on tap 2 sent 3 raw OS clicks for two taps.
-            # Hold the single click until the double-tap window closes;
-            # cancel it if a second tap arrives in time. Click at the
-            # position captured now, not wherever the cursor drifts to by
-            # the time the deferred click fires.
-            tap_pos = st.last_cursor_pos
-            if st.pending_click_timer is not None and t - st.last_tap < config.DOUBLE_TAP_WINDOW_S:
-                st.pending_click_timer.cancel()
-                st.pending_click_timer = None
-                if tap_pos:
-                    actions.double_click(*tap_pos)
-                else:
-                    actions.double_click()
-            else:
-                timer = threading.Timer(
-                    config.DOUBLE_TAP_WINDOW_S, actions.click,
-                    args=tap_pos if tap_pos else (),
-                )
-                timer.daemon = True
-                timer.start()
-                st.pending_click_timer = timer
-            st.last_tap = t
-
-        # thumb must be extended too - the checkmark is traced with the
-        # index, but requiring the thumb out makes it a deliberate "L-ish"
-        # hand shape so a stray index flick with the thumb tucked can't
-        # trigger a zoom
-        if not grab and not open_palm and index_up and extended["thumb"] and checkmark_event == "in":
-            actions.zoom_in()
-
-        self.last_telemetry = {
-            "raw_x": round(float(raw_ix), 4),
-            "raw_y": round(float(raw_iy), 4),
-            "screen_x": round(screen_pos[0], 1) if screen_pos else "",
-            "screen_y": round(screen_pos[1], 1) if screen_pos else "",
-            "fingers_down": "+".join(n for n in gestures.FINGER_NAMES if down[n]) or "none",
-            "thumb_zvel": round(st.touches["thumb"].velocity, 3),
-            "index_zvel": round(st.touches["index"].velocity, 3),
-            "index_touch_event": events["index"] or "",
-            "index_last_dwell": round(st.touches["index"].last_dwell, 3),
-            "index_last_travel": round(st.touches["index"].last_travel, 4),
-            "index_max_xy_speed": round(st.touches["index"].last_max_xy_speed, 4),
-            "pinch_ratio": round(ratio, 3),
-            "checkmark_event": checkmark_event or "",
-            "checkmark_leg1": round(st.checkmark.last_leg1_len, 4),
-            "checkmark_leg2": round(st.checkmark.last_leg2_len, 4),
-            "checkmark_max_zvel": round(st.checkmark.last_max_zvel, 4),
-            "checkmark_stroke_speed": round(st.checkmark.last_stroke_speed, 4),
-            "candidate_pose": "grab" if grab else ("scroll" if pose else ("fist" if is_fist else ("point" if point else ("open_palm" if open_palm else "none")))),
-            "active_state": "grab" if grab else ("scroll" if scroll else ("fist" if is_fist else ("point" if point else ("open_palm" if open_palm else "none")))),
-            "thumb_extended": extended["thumb"],
-            "thumb_ratio": round(st.exts["thumb"].ratio, 3),
-            "index_extended": extended["index"],
-            "middle_extended": extended["middle"],
-            "index_ratio": round(st.exts["index"].ratio, 3),
-            "middle_ratio": round(st.exts["middle"].ratio, 3),
-            "ring_extended": extended["ring"],
-            "pinky_extended": extended["pinky"],
-            "ring_ratio": round(st.exts["ring"].ratio, 3),
-            "pinky_ratio": round(st.exts["pinky"].ratio, 3),
-        }
-
-    @staticmethod
-    def _remap_range(v, lo, hi):
-        v = min(max(v, lo), hi)
-        return (v - lo) / (hi - lo)
-
-    def _move_cursor_absolute(self, st, lm, t):
-        raw_x, raw_y = lm[config.INDEX_TIP, :2]
-        nx = self._remap_range(float(raw_x), config.CURSOR_ACTIVE_X_MIN, config.CURSOR_ACTIVE_X_MAX)
-        ny = self._remap_range(float(raw_y), config.CURSOR_ACTIVE_Y_MIN, config.CURSOR_ACTIVE_Y_MAX)
-        fx, fy = st.cursor_filter(nx * self._screen_w, ny * self._screen_h, t)
-
-        # clamp large single-frame jumps (real gaps during inference stalls,
-        # not glitches) so the cursor glides instead of teleporting - the
-        # filter's own state still tracks the true value, so it self-corrects
-        if st.last_cursor_pos is not None:
-            px, py = st.last_cursor_pos
-            dx, dy = fx - px, fy - py
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist > config.CURSOR_MAX_JUMP_PX:
-                scale = config.CURSOR_MAX_JUMP_PX / dist
-                fx, fy = px + dx * scale, py + dy * scale
-        st.last_cursor_pos = (fx, fy)
-
-        actions.move_cursor_absolute(fx, fy)
-        return fx, fy
+    def close(self):
+        """Call on exit, so nothing a pose did outlives the app (e.g. mute)."""
+        for p in self.poses:
+            p.on_close(self)

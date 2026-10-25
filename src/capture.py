@@ -10,7 +10,7 @@ import cv2
 import config
 
 _MAX_CONSECUTIVE_READ_FAILURES = 30  # ~1s of failed reads = treat as disconnected, not a blip
-# A frozen DirectShow feed hands back the same picture for tens of seconds
+# A frozen feed (seen on DirectShow) hands back the same picture for tens of seconds
 # while still reporting ok=True. Frame-pixel checks (exact or near-equal)
 # proved unreliable at spotting it - the frozen scene still carries enough
 # sensor/transport noise to look "different". So the freeze is detected one
@@ -22,8 +22,17 @@ _MAX_CONSECUTIVE_READ_FAILURES = 30  # ~1s of failed reads = treat as disconnect
 class ThreadedCamera:
     def __init__(self):
         self.cap = self._open_capture()
-        self._lock = threading.Lock()
+        # Condition, not a plain Lock: read() blocks until the capture thread
+        # publishes a frame it hasn't returned yet. The main loop outruns
+        # the camera (CPU inference is ~7ms, a 15-30fps webcam is 33-66ms),
+        # and re-processing the same frame feeds the gesture filters
+        # zero-motion samples followed by a jump - distorting z-velocity
+        # (tap detection) and tripping main.py's frozen-feed check on what
+        # is really just a repeat of one frame.
+        self._lock = threading.Condition()
         self._frame = None
+        self._seq = 0  # bumped per captured frame
+        self._last_read_seq = 0
         self._running = True
         self._reopen_requested = False
         self.disconnected = False  # distinguishes "gave up" from "hasn't produced a frame yet"
@@ -37,13 +46,11 @@ class ThreadedCamera:
 
     @staticmethod
     def _open_capture():
-        # if this raises "Could not open webcam" on macOS/Linux, the fix is
-        # config.CAMERA_BACKEND (Windows-only DirectShow) - see its comment
         cap = cv2.VideoCapture(config.CAMERA_INDEX, config.CAMERA_BACKEND)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*config.CAMERA_FOURCC))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, config.CAMERA_BUFFERSIZE)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open webcam (index {config.CAMERA_INDEX})")
         return cap
@@ -68,7 +75,8 @@ class ThreadedCamera:
                     print("Webcam reopen failed, giving up.", flush=True)
                     with self._lock:
                         self._frame = None
-                    self.disconnected = True
+                        self.disconnected = True
+                        self._lock.notify_all()
                     self._running = False
                     break
 
@@ -77,6 +85,8 @@ class ThreadedCamera:
                 failures = 0
                 with self._lock:
                     self._frame = frame
+                    self._seq += 1
+                    self._lock.notify_all()
                 continue
             failures += 1
             if failures >= _MAX_CONSECUTIVE_READ_FAILURES:
@@ -85,14 +95,21 @@ class ThreadedCamera:
                 # read() signals "no data" instead of freezing on a stale one
                 with self._lock:
                     self._frame = None
-                self.disconnected = True
+                    self.disconnected = True
+                    self._lock.notify_all()
                 self._running = False
                 break
             time.sleep(0.01)  # a transient glitch, not a disconnect - don't spin
 
-    def read(self):
+    def read(self, timeout=0.5):
+        """Newest frame not yet returned, waiting up to `timeout` for one.
+        None = nothing new yet (or disconnected - check .disconnected)."""
         with self._lock:
-            return None if self._frame is None else self._frame.copy()
+            self._lock.wait_for(lambda: self._seq != self._last_read_seq or self.disconnected, timeout)
+            if self._frame is None or self._seq == self._last_read_seq:
+                return None
+            self._last_read_seq = self._seq
+            return self._frame.copy()
 
     def release(self):
         self._running = False

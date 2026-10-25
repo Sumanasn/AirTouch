@@ -1,303 +1,185 @@
-"""Per-fingertip virtual-touch detection: a finger 'touches' the virtual
-screen when it pushes toward the camera fast enough (scale-invariant
-z-velocity - the same trigger idea as touching real glass), and 'lifts' on
-the matching retract. Level-triggered, not a single pulse, so a brief
-down-then-up reads as a tap while a held-down finger drives drag.
+"""Shared hand features, built on all 21 MediaPipe landmarks - what every
+pose plugin in poses/ builds on. Pose-specific detectors live in their
+pose's own file (poses/knob.py, poses/point.py, ...), not here.
+
+  - landmark names (WRIST, INDEX_TIP, ...) and hand geometry helpers
+  - FingerExtension: extended/curled per finger from the joint angles along
+    all 4 of its points (metric 3D world landmarks)
+  - PoseClassifier: picks the most confident pose plugin
+  - BunchDetector: all five fingertips drawing together - the window
+    overview, which works from any pose so belongs to none
+
+Landmark indices are MediaPipe's own numbering - 0 wrist, then per finger
+base to tip: thumb CMC 1, MCP 2, IP 3, tip 4; the others MCP, PIP, DIP, tip
+(index 5-8, middle 9-12, ring 13-16, pinky 17-20). `world` is the (21, 3)
+metric array (Hand.world), `img` the (21, 3) normalized image one
+(Hand.all_landmarks).
 """
+import math
+from collections import deque
+
 import numpy as np
 
 import config
-from filters import OneEuroFilter
 
 FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
-TIP_INDEX = {
-    "thumb": config.THUMB_TIP,
-    "index": config.INDEX_TIP,
-    "middle": config.MIDDLE_TIP,
-    "ring": config.RING_TIP,
-    "pinky": config.PINKY_TIP,
+FINGER_CHAIN = {
+    "thumb": (1, 2, 3, 4),
+    "index": (5, 6, 7, 8),
+    "middle": (9, 10, 11, 12),
+    "ring": (13, 14, 15, 16),
+    "pinky": (17, 18, 19, 20),
 }
-MID_INDEX = {
-    "thumb": config.THUMB_MID,
-    "index": config.INDEX_MID,
-    "middle": config.MIDDLE_MID,
-    "ring": config.RING_MID,
-    "pinky": config.PINKY_MID,
-}
+WRIST, INDEX_MCP, INDEX_PIP, MIDDLE_MCP, PINKY_MCP = 0, 5, 6, 9, 17
+TIPS = (4, 8, 12, 16, 20)
+THUMB_TIP, INDEX_TIP, MIDDLE_TIP = TIPS[:3]
 
 
-def palm_scale(landmarks: np.ndarray) -> float:
-    """Mean wrist-to-fingertip distance across all 5 tips. Chosen over
-    inter-tip spread because spread collapses toward zero during a pinch or
-    5-finger touch, which would blow up the z-velocity denominator exactly
-    when those gestures are active."""
-    wrist = landmarks[config.WRIST, :2]
-    dists = [np.linalg.norm(landmarks[TIP_INDEX[n], :2] - wrist) for n in FINGER_NAMES]
-    return float(np.mean(dists))
+def angle_deg(a, b) -> float:
+    """Angle between two vectors, in degrees."""
+    cos = float(np.dot(a, b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-9))
+    return math.degrees(math.acos(min(max(cos, -1.0), 1.0)))
+
+
+def palm_width(world: np.ndarray) -> float:
+    """Index-knuckle to pinky-knuckle distance - the hand's own ruler, so
+    distance-based measures don't depend on hand size."""
+    return max(float(np.linalg.norm(world[INDEX_MCP] - world[PINKY_MCP])), 1e-6)
+
+
+def finger_bend_deg(world: np.ndarray, name: str) -> float:
+    """Total bend along a (non-thumb) finger: the angle at each of its three
+    joints between the bones either side, summed - knuckle (wrist->MCP vs.
+    MCP->PIP), middle joint (MCP->PIP vs. PIP->DIP) and end joint (PIP->DIP
+    vs. DIP->tip). Uses all 4 of the finger's points plus the wrist, in
+    world (metric) coordinates so perspective can't distort the angles.
+    Roughly 0-40 straight, 200+ curled into a fist."""
+    mcp, pip, dip, tip = (world[i] for i in FINGER_CHAIN[name])
+    return (
+        angle_deg(mcp - world[WRIST], pip - mcp)
+        + angle_deg(pip - mcp, dip - pip)
+        + angle_deg(dip - pip, tip - dip)
+    )
+
+
+def thumb_spread(world: np.ndarray) -> float:
+    """Thumb tip's distance from the index knuckle, in palm widths. The
+    thumb's own joints barely bend between tucked and stuck out - it mostly
+    swings at its base - so "is it out" is judged by where its tip ends up:
+    tucked against the index/palm reads low, out in an L reads high."""
+    return float(np.linalg.norm(world[THUMB_TIP] - world[INDEX_MCP])) / palm_width(world)
+
+
+def _ramp(v: float, zero_at: float, one_at: float) -> float:
+    """0 at zero_at, 1 at one_at, linear in between, clamped (either order)."""
+    return min(max((v - zero_at) / (one_at - zero_at), 0.0), 1.0)
 
 
 class FingerExtension:
-    """Schmitt-trigger-style extended/curled state for one finger, from the
-    tip-to-wrist vs mid-joint-to-wrist distance ratio (a curled finger's tip
-    sits close to its own mid-joint; an extended one's is much farther out)."""
+    """How extended one finger is, as a 0..1 score - a linear ramp between
+    the curled and extended thresholds, so a finger caught halfway counts as
+    half-evidence for every pose instead of flipping a yes/no. Index-pinky
+    ramp on finger_bend_deg (less bend = more extended); the thumb on
+    thumb_spread (more spread = more extended). Hysteresis lives one level
+    up, in PoseClassifier's smoothing and switch margin."""
 
     def __init__(self, name):
         self.name = name
-        self.extended = False
-        self.ratio = 0.0  # last computed ratio, kept for telemetry/calibration
+        self.score = 0.0  # 0 = fully curled .. 1 = fully extended
+        self.extended = False  # score >= 0.5 - display-only (overlay markers)
+        self.value = 0.0  # last bend (deg), or spread for the thumb - telemetry/overlay
 
-    def update(self, landmarks: np.ndarray) -> bool:
-        # 2D for the thumb (its short IP-to-tip segment amplifies Z-axis
-        # noise disproportionately), 3D for the rest.
-        dims = slice(2) if self.name == "thumb" else slice(3)
-        wrist = landmarks[config.WRIST, dims]
-        tip = landmarks[TIP_INDEX[self.name], dims]
-        mid = landmarks[MID_INDEX[self.name], dims]
-        mid_dist = max(float(np.linalg.norm(mid - wrist)), 1e-6)
-        ratio = float(np.linalg.norm(tip - wrist)) / mid_dist
-        self.ratio = ratio
-
-        if ratio > config.FINGER_EXTEND_RATIO[self.name]:
-            self.extended = True
-        elif ratio < config.FINGER_CURL_RATIO[self.name]:
-            self.extended = False
-        return self.extended
-
-
-def pinch_ratio(landmarks: np.ndarray) -> float:
-    """thumb-index tip distance normalized by palm scale, for pinch-zoom."""
-    scale = max(palm_scale(landmarks), 1e-6)
-    thumb = landmarks[config.THUMB_TIP, :2]
-    index = landmarks[config.INDEX_TIP, :2]
-    return float(np.linalg.norm(thumb - index) / scale)
-
-
-class FingerTouch:
-    """Schmitt-trigger-style down/up state for one fingertip, from a
-    One-Euro-filtered z-position (depth relative to wrist, scale-normalized).
-    Filtering the position before differentiating it is cleaner than
-    smoothing an already-noisy raw velocity, and the filter's own
-    time-aware smoothing handles uneven frame timing on its own."""
-
-    def __init__(self, name):
-        self.name = name
-        self.down = False
-        self.down_since = 0.0
-        self.down_pos = (0.0, 0.0)
-        self.max_travel = 0.0
-        self.max_xy_speed = 0.0
-        self.velocity = 0.0  # last filtered z-velocity, kept for telemetry
-        self.last_dwell = 0.0   # dwell/travel of the most recently resolved down->up cycle,
-        self.last_travel = 0.0  # kept for telemetry so we can see why a cycle became "up" not "tap"
-        self.last_max_xy_speed = 0.0  # peak on-screen (x,y) speed during that cycle - see TAP_FAST_MIN_SPEED
-        self._prev_xy = None
-        self._prev_t = None
-        self._z_filter = OneEuroFilter(
-            config.Z_ONE_EURO_MIN_CUTOFF, config.Z_ONE_EURO_BETA, config.Z_ONE_EURO_D_CUTOFF
-        )
-
-    def update(self, landmarks, t):
-        """Returns (event, (x, y)) where event is None | 'down' | 'tap' | 'up'."""
-        tip_idx = TIP_INDEX[self.name]
-        scale = max(palm_scale(landmarks), 1e-6)
-        raw_z = (landmarks[tip_idx, 2] - landmarks[config.WRIST, 2]) / scale
-        self._z_filter(raw_z, t)
-        vel = self._z_filter.last_velocity
-        self.velocity = vel
-        x, y = landmarks[tip_idx, :2]
-        event = None
-
-        if self._prev_xy is not None:
-            pdt = max(t - self._prev_t, 1e-6)
-            xy_speed = float(np.hypot(x - self._prev_xy[0], y - self._prev_xy[1])) / pdt
+    def update(self, world: np.ndarray) -> float:
+        if self.name == "thumb":
+            self.value = thumb_spread(world)
+            self.score = _ramp(self.value, config.THUMB_IN_SPREAD, config.THUMB_OUT_SPREAD)
         else:
-            xy_speed = 0.0
-        self._prev_xy, self._prev_t = (float(x), float(y)), t
-
-        if not self.down:
-            if vel < config.TOUCH_DOWN_VELOCITY:
-                self.down = True
-                self.down_since = t
-                self.down_pos = (float(x), float(y))
-                self.max_travel = 0.0
-                self.max_xy_speed = xy_speed
-                event = "down"
-        else:
-            travel = float(np.hypot(x - self.down_pos[0], y - self.down_pos[1]))
-            self.max_travel = max(self.max_travel, travel)
-            self.max_xy_speed = max(self.max_xy_speed, xy_speed)
-            dwell = t - self.down_since
-            # a genuine lift (fast retraction) OR a hard timeout, so a
-            # false/stray down - or a real but slow retraction - can't
-            # linger indefinitely. The timeout path is never a "tap".
-            if vel > config.TOUCH_UP_VELOCITY or dwell > config.TOUCH_STUCK_TIMEOUT_S:
-                self.down = False
-                self.last_dwell = dwell
-                self.last_travel = self.max_travel
-                self.last_max_xy_speed = self.max_xy_speed
-                # A tap that qualifies on raw travel is unambiguous. One
-                # that exceeds TAP_MAX_TRAVEL can still count if it moved
-                # fast enough - see TAP_FAST_MIN_SPEED.
-                travel_ok = self.max_travel < config.TAP_MAX_TRAVEL
-                fast_ok = self.max_xy_speed > config.TAP_FAST_MIN_SPEED
-                if dwell < config.TAP_MAX_DWELL_S and (travel_ok or fast_ok):
-                    event = "tap"
-                else:
-                    event = "up"
-
-        return event, (float(x), float(y))
+            self.value = finger_bend_deg(world, self.name)
+            self.score = _ramp(self.value, config.FINGER_CURLED_MIN_BEND, config.FINGER_EXTENDED_MAX_BEND)
+        self.extended = self.score >= 0.5
+        return self.score
 
 
-class SwipeDetector:
-    """Fires 'left'/'right' when the wrist moves fast and cleanly along the
-    horizontal axis - used for the 4/5-finger slide (Alt+Tab). Vertical
-    motion isn't handled here; see state_machine.py's volume handling
-    instead, since a lift/lower swipe would have the same "return stroke"
-    problem this detector guards against, but worse.
+class PoseClassifier:
+    """Picks the pose with the highest confidence, among whatever pose
+    plugins were loaded (poses/ - each scores itself via confidence()).
+    Confidences are smoothed over frames (exponential, POSE_SMOOTHING) so one
+    noisy frame can't flip the pose; the winner must reach
+    POSE_MIN_CONFIDENCE (else "none"), and displacing the current pose takes
+    a POSE_SWITCH_MARGIN lead, so two poses scoring neck-and-neck don't
+    flicker between each other."""
 
-    After firing, a swipe in the OPPOSITE direction is held back until
-    speed drops below SWIPE_SETTLE_SPEED once - otherwise the hand
-    naturally moving back to rest right after a swipe reads as a second
-    swipe the other way."""
+    def __init__(self, poses):
+        self.poses = poses
+        self.raw = {p.name: 0.0 for p in poses}       # this frame's confidences
+        self.smoothed = {p.name: 0.0 for p in poses}  # what the choice is made on
+        self.pose = "none"
+
+    @property
+    def confidence(self) -> float:
+        return self.smoothed.get(self.pose, 0.0)
+
+    def update(self, frame) -> str:
+        """frame: poses.Frame. Also fills frame.raw_confidences."""
+        self.raw = {p.name: float(p.confidence(frame)) for p in self.poses}
+        frame.raw_confidences = self.raw
+        if not self.raw:
+            return "none"
+        for k, v in self.raw.items():
+            self.smoothed[k] += config.POSE_SMOOTHING * (v - self.smoothed[k])
+        best = max(self.smoothed, key=self.smoothed.get)
+        if self.smoothed[best] < config.POSE_MIN_CONFIDENCE:
+            self.pose = "none"
+        elif best != self.pose and (
+            self.confidence < config.POSE_MIN_CONFIDENCE  # current pose has faded - no margin owed
+            or self.smoothed[best] > self.confidence + config.POSE_SWITCH_MARGIN
+        ):
+            self.pose = best
+        return self.pose
+
+
+def tip_spread(world: np.ndarray) -> float:
+    """Mean distance of the five fingertips from their own centroid, in palm
+    widths - large with the fingers spread, near zero with all five tips
+    pinched together."""
+    tips = world[list(TIPS)]
+    return float(np.linalg.norm(tips - tips.mean(axis=0), axis=1).mean()) / palm_width(world)
+
+
+class BunchDetector:
+    """Fires once when all five fingertips draw together: the tip spread
+    falls below BUNCH_CLOSED_SPREAD having been above BUNCH_OPEN_SPREAD
+    within the last BUNCH_WINDOW_S - a deliberate closing motion, not just
+    a hand that happens to rest bunched. Re-arms only once the hand opens
+    past BUNCH_OPEN_SPREAD again.
+
+    A fist also brings the tips together, so the fingers must also be
+    fairly straight (mean non-thumb bend under BUNCH_MAX_MEAN_BEND): bunched
+    fingers bend mostly at the knuckles, a fist curls every joint."""
 
     def __init__(self):
-        self.last_fire = -999.0
-        self.last_direction = None
-        self.settled = True
+        self._history = deque()  # (t, spread)
+        self.armed = True
+        self.spread = 0.0  # last value, for telemetry/overlay
 
-    def update(self, vx: float, vy: float, t: float):
-        if max(abs(vx), abs(vy)) < config.SWIPE_SETTLE_SPEED:
-            self.settled = True
+    def update(self, world: np.ndarray, mean_bend: float, t: float) -> bool:
+        s = tip_spread(world)
+        self.spread = s
+        self._history.append((t, s))
+        while self._history and t - self._history[0][0] > config.BUNCH_WINDOW_S:
+            self._history.popleft()
 
-        if t - self.last_fire < config.SWIPE_COOLDOWN_S:
-            return None
-
-        direction = None
-        if abs(vy) <= config.SWIPE_MAX_CROSS_DRIFT:
-            if vx > config.SWIPE_MIN_SPEED:
-                direction = "right"
-            elif vx < -config.SWIPE_MIN_SPEED:
-                direction = "left"
-
-        if direction is None:
-            return None
-        opposite = {"left": "right", "right": "left"}
-        if direction == opposite.get(self.last_direction) and not self.settled:
-            return None  # still the return stroke of the last swipe
-
-        self.last_fire = t
-        self.last_direction = direction
-        self.settled = False
-        return direction
-
-
-class ZoomDetector:
-    """Fires 'out' when thumb+index pinch close together, debounced by
-    ZOOM_ENTRY_DEBOUNCE_FRAMES before the first fire and rate-limited by
-    ZOOM_COOLDOWN_S after that, so it still tracks a held pinch continuously
-    rather than re-debouncing every tick. Zoom-in is CheckmarkDetector, not
-    this - a pinch-adjacent pose for "in" turned out to be too easily
-    satisfied by a resting hand."""
-
-    def __init__(self):
-        self.last_fire = -999.0
-        self.out_count = 0
-
-    def update(self, ratio: float, t: float):
-        if ratio < config.ZOOM_PINCH_RATIO:
-            self.out_count = min(self.out_count + 1, config.ZOOM_ENTRY_DEBOUNCE_FRAMES)
-        else:
-            self.out_count = 0
-
-        if t - self.last_fire < config.ZOOM_COOLDOWN_S:
-            return None
-        if self.out_count >= config.ZOOM_ENTRY_DEBOUNCE_FRAMES:
-            self.last_fire = t
-            return "out"
-        return None
-
-
-class CheckmarkDetector:
-    """Fires 'in' when the index fingertip traces a checkmark: a short
-    down-stroke immediately followed by a longer up-and-right stroke, with
-    the depth (z) staying calm the whole time.
-
-    Keeps a short rolling buffer of (t, x, y, zvel) fingertip samples, finds
-    the buffer's lowest point (largest y - image y grows downward) as the
-    stroke's "elbow" - excluding the buffer's own endpoints, so a straight
-    motion can't "elbow" at its own start or end - and checks the two legs
-    on either side of it match a checkmark's shape.
-
-    The zvel gate exists because reaching the index finger toward the
-    camera - a tap attempt - naturally dips-then-rises on screen too (the
-    wrist flexes as the arm extends), tracing something shape-wise
-    indistinguishable from a real checkmark, without ever pushing toward
-    the camera the way a real checkmark stroke doesn't either. Shape alone
-    (leg lengths, their ratio) turned out not to separate genuine
-    checkmarks from accidental hover-wobble traces either; the zvel cap
-    combined with a minimum stroke speed is what actually worked, at the
-    cost of also rejecting some genuine checkmarks - see CHECKMARK_MAX_ZVEL
-    in config.py for the tradeoff."""
-
-    def __init__(self):
-        self.buffer = []  # list of (t, x, y, zvel), pruned to CHECKMARK_WINDOW_S
-        self.last_fire = -999.0
-        # last-evaluated values, kept for telemetry even on frames that
-        # don't fire - same idea as FingerTouch's last_dwell
-        self.last_leg1_len = 0.0
-        self.last_leg2_len = 0.0
-        self.last_max_zvel = 0.0
-        self.last_stroke_speed = 0.0  # peak frame-to-frame (x,y) speed in the buffered window
-
-    def update(self, x: float, y: float, zvel: float, t: float) -> str | None:
-        self.buffer.append((t, x, y, zvel))
-        cutoff = t - config.CHECKMARK_WINDOW_S
-        self.buffer = [s for s in self.buffer if s[0] >= cutoff]
-        if len(self.buffer) < 3:
-            return None
-
-        _, start_x, start_y, _ = self.buffer[0]
-        elbow_i = max(range(1, len(self.buffer) - 1), key=lambda i: self.buffer[i][2])
-        _, elbow_x, elbow_y, _ = self.buffer[elbow_i]
-        _, end_x, end_y, _ = self.buffer[-1]
-        max_zvel = max(abs(s[3]) for s in self.buffer)
-        self.last_max_zvel = max_zvel
-
-        stroke_speed = 0.0
-        for (t1, x1, y1, _), (t2, x2, y2, _) in zip(self.buffer, self.buffer[1:]):
-            pdt = max(t2 - t1, 1e-6)
-            stroke_speed = max(stroke_speed, float(np.hypot(x2 - x1, y2 - y1)) / pdt)
-        self.last_stroke_speed = stroke_speed
-
-        leg1_dx, leg1_dy = elbow_x - start_x, elbow_y - start_y
-        leg2_dx, leg2_dy = end_x - elbow_x, end_y - elbow_y
-        leg1_len = float(np.hypot(leg1_dx, leg1_dy))
-        leg2_len = float(np.hypot(leg2_dx, leg2_dy))
-        self.last_leg1_len = leg1_len
-        self.last_leg2_len = leg2_len
-
-        if t - self.last_fire < config.CHECKMARK_COOLDOWN_S:
-            return None
-        if max_zvel > config.CHECKMARK_MAX_ZVEL:            # depth wasn't calm - likely a tap, not a trace
-            return None
-        if stroke_speed < config.CHECKMARK_MIN_STROKE_SPEED:  # too slow - likely idle hover wobble
-            return None
-        if leg1_len < config.CHECKMARK_MIN_LEG1 or leg2_len < config.CHECKMARK_MIN_LEG2:
-            return None
-        if leg1_dy < config.CHECKMARK_MIN_DOWN:            # leg 1 must move down
-            return None
-        if -leg2_dy < config.CHECKMARK_MIN_UP:              # leg 2 must move up
-            return None
-        if leg2_dx < config.CHECKMARK_MIN_RIGHT:            # leg 2 must move right
-            return None
-        if leg2_len < config.CHECKMARK_LEG_RATIO * leg1_len:  # leg 2 must be the longer stroke
-            return None
-        # no separate max-duration check needed: CHECKMARK_WINDOW_S already
-        # bounds how much history "start" can ever be (a stray end_t-start_t
-        # check here was comparing against a window boundary that's nearly
-        # always ~CHECKMARK_WINDOW_S old once warmed up, regardless of how
-        # fast the actual stroke was - it never let anything through)
-
-        self.last_fire = t
-        self.buffer = []
-        return "in"
+        if not self.armed:
+            if s > config.BUNCH_OPEN_SPREAD:
+                self.armed = True
+            return False
+        recent_max = max(v for _, v in self._history)
+        if (
+            s < config.BUNCH_CLOSED_SPREAD
+            and recent_max > config.BUNCH_OPEN_SPREAD
+            and mean_bend < config.BUNCH_MAX_MEAN_BEND
+        ):
+            self.armed = False
+            self._history.clear()
+            return True
+        return False

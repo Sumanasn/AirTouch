@@ -1,37 +1,40 @@
-"""Tunable thresholds. Retune TOUCH_*/TAP_* by watching main.py's debug
-overlay ('d' key) — z-depth noise varies by webcam and distance from it.
-
-Only the wrist + 5 fingertips + 5 mid-joints are ever extracted from
-MediaPipe's 21 landmarks — see landmarks.py. Indices below are into that
-compact 11-row array, not MediaPipe's own numbering.
+"""Tunable thresholds. Most gesture values are first guesses on the Linux
+webcam - retune from telemetry.csv (each section names its columns) and the
+live readouts in main.py's debug overlay ('d' key).
 """
-import cv2
+import sys
 
-# Compact landmark indices (wrist kept only as scale/depth reference)
-WRIST = 0
-THUMB_TIP = 1
-INDEX_TIP = 2
-MIDDLE_TIP = 3
-RING_TIP = 4
-PINKY_TIP = 5
-THUMB_MID = 6   # IP joint
-INDEX_MID = 7   # PIP joint
-MIDDLE_MID = 8
-RING_MID = 9
-PINKY_MID = 10
+import cv2
 
 # Webcam capture - tuned for latency, not image quality
 CAMERA_INDEX = 0
-# WINDOWS-ONLY VALUE - the #1 thing to change to run this on another OS.
-# DirectShow doesn't exist outside Windows; cv2.VideoCapture(index, backend)
-# will fail to open the camera at all with this set on macOS/Linux. Swap
-# for cv2.CAP_AVFOUNDATION on macOS, cv2.CAP_V4L2 on Linux, or cv2.CAP_ANY
-# to let OpenCV auto-pick (simplest, but loses the "bypass the heavier
-# wrapper" latency win this specific backend was chosen for on Windows).
-CAMERA_BACKEND = cv2.CAP_DSHOW
-CAMERA_WIDTH = 320
-CAMERA_HEIGHT = 240
+# OS-SPECIFIC. DirectShow on Windows (bypasses the heavier MSMF wrapper -
+# the latency win it was chosen for), V4L2 on Linux, AVFoundation on macOS.
+if sys.platform == "win32":
+    CAMERA_BACKEND = cv2.CAP_DSHOW
+elif sys.platform == "darwin":
+    CAMERA_BACKEND = cv2.CAP_AVFOUNDATION
+else:
+    CAMERA_BACKEND = cv2.CAP_V4L2
+# 640x480 on Linux: many UVC webcams don't offer 320x240 at all, and V4L2
+# silently substitutes some other mode (352x288 on the SPCA2281 this was
+# ported on). 640x480 keeps the same 4:3 field of view the CURSOR_ACTIVE_*
+# box was tuned on; CPU inference stays ~7ms/frame at this size.
+CAMERA_WIDTH = 320 if sys.platform == "win32" else 640
+CAMERA_HEIGHT = 240 if sys.platform == "win32" else 480
 CAMERA_FOURCC = "MJPG"  # most webcams cap at 30fps on YUY2; MJPG unlocks 60fps
+# Driver-side frame queue. 1 = always-freshest frame on DirectShow, but on
+# V4L2 a single buffer halves the delivered frame rate (the driver drops
+# every frame that arrives while userspace still holds the only buffer -
+# measured 8.5fps vs 16.6fps). ThreadedCamera already drains the queue
+# continuously, so 2 costs no extra latency there.
+CAMERA_BUFFERSIZE = 1 if sys.platform == "win32" else 2
+
+# Screen size (px) the cursor maps onto. None = auto-detect (pyautogui on
+# Windows/macOS; xrandr on Linux, which under Wayland reports XWayland's
+# root size = the logical desktop). Set explicitly, e.g. (2560, 1440), if
+# detection gets it wrong (fractional scaling, unusual multi-monitor).
+SCREEN_SIZE = None
 
 MAX_HANDS = 1
 # Lowered from 0.6/0.5: hand-detection dropouts (cursor frozen, no hand to
@@ -42,41 +45,49 @@ MAX_HANDS = 1
 DETECTION_CONFIDENCE = 0.4
 TRACKING_CONFIDENCE = 0.3
 
-# Virtual-touch: each fingertip is a Schmitt trigger on z-velocity (push
-# toward the camera = "down"). The velocity is a One-Euro filter's own
-# internal derivative on the raw z-position. Only D_CUTOFF actually shapes
-# that velocity signal (MIN_CUTOFF/BETA tune the filtered position, which
-# FingerTouch discards) - retune D_CUTOFF from telemetry.
-Z_ONE_EURO_MIN_CUTOFF = 1.0
-Z_ONE_EURO_BETA = 0.3
-Z_ONE_EURO_D_CUTOFF = 1.2
-# Tightened from -1.8: ordinary pointing jitter crossed -1.8 often enough
-# to trigger false downs that then lingered for 5-48s. -2.4 sits above
-# normal noise but below genuine deliberate pushes.
-TOUCH_DOWN_VELOCITY = -2.4   # z_norm_velocity below this = finger touches down
-# Loosened from 1.5: a stuck false-down should resolve quickly, not linger
-# for tens of seconds swallowing the next genuine attempt.
-TOUCH_UP_VELOCITY = 1.2      # z_norm_velocity above this while down = lifts
-# Both raised: genuine fast taps were still missing the old, tighter caps.
-TAP_MAX_DWELL_S = 0.85
-TAP_MAX_TRAVEL = 0.18        # normalized xy distance; above this = drag, not tap
-# Rescues a tap that exceeds TAP_MAX_TRAVEL if it moved fast enough - see
-# FingerTouch.update(). The travel cap alone was disqualifying more fast,
-# genuine taps than it accepted; a deliberate tap covers more ground than
-# a slow drift/drag covers in the same distance, so speed tells them apart.
-TAP_FAST_MIN_SPEED = 8.0
-DOUBLE_TAP_WINDOW_S = 0.30
-# Hard safety valve: a "down" touch cycle can't linger forever - a
-# false/stray down (or a slow retraction) could otherwise stick for
-# 30-48s waiting to cross TOUCH_UP_VELOCITY. Past this, force-resolve as
-# "up", never "tap" - a clean tap already resolves well inside
-# TAP_MAX_DWELL_S on its own.
-TOUCH_STUCK_TIMEOUT_S = 2.0
+DOUBLE_TAP_WINDOW_S = 0.30  # second click within this is labeled DOUBLE CLICK (the OS does the combining)
 
-# Grab additionally requires thumb+index close in XY - z-touch alone fired
-# from a peace sign, a point, even an open palm. Must stay TIGHTER than
-# ZOOM_PINCH_RATIO or a zoom-out attempt gets swallowed by grab first.
-GRAB_PINCH_RATIO = 0.25
+# Flex-tap click (poses/point.py FlexTap), in the point pose: the index's bend
+# angle = 3D angle between the wrist->knuckle (metacarpal) direction and the
+# PIP->tip direction, so it covers bending at the knuckle (a mouse-click-
+# style flick) and at the middle joint alike. ~0-25 deg pointing straight,
+# rising as the finger bends. Telemetry: index_flex_* columns.
+FLEX_ONE_EURO_MIN_CUTOFF = 2.0  # position smoothing - unused output, FlexTap reads only the velocity
+FLEX_ONE_EURO_BETA = 0.01
+FLEX_ONE_EURO_D_CUTOFF = 2.0    # shapes the angular velocity - the trigger signal
+# Lowered from 120: a real click attempt in the first recording peaked at
+# 98deg/s; point-pose jitter alone sits under ~30deg/s (90th pct)
+FLEX_DOWN_VELOCITY = 90.0       # deg/s bending faster than this = press begins
+FLEX_UP_VELOCITY = 60.0         # deg/s straightening faster than this while pressed = release
+# ...or released once the finger has unbent this fraction of the way from
+# its peak back toward the pre-press angle, regardless of speed
+FLEX_RELEASE_RETURN_FRAC = 0.5
+# Lowered from 15: recorded deliberate clicks bent only 15-19deg, right on
+# the old line
+FLEX_MIN_EXCURSION_DEG = 12.0   # peak bend minus pre-press angle; below = jitter, not a click
+FLEX_TAP_MAX_DWELL_S = 0.6      # press->release longer than this = deliberate hold, not a click
+FLEX_STUCK_TIMEOUT_S = 1.5      # force-release a press that never sees a fast straighten
+# The velocity trigger fires a frame or two into the bend, so the
+# pre-press angle (and cursor position) is taken from this many frames back
+FLEX_LOOKBACK_FRAMES = 3
+
+# Two-finger slide (index + middle out, ring/pinky curled - poses/scroll.py
+# SlideScroll): one wheel notch per this much vertical fingertip travel, as
+# a fraction of frame height - 0.015 = a 15% sweep scrolls 10 notches.
+# Telemetry: scroll_travel.
+SCROLL_STEP = 0.015
+# Wiggle tolerance: the tips must move this far (fraction of frame height)
+# in one direction before scrolling starts or switches direction. Small
+# wobbles and the bounce at the end of a stroke stay under it; real sweeps
+# in recordings were 0.05-0.19.
+SCROLL_DEADZONE = 0.03
+# Light smoothing: heavier lagged so much that a quick 0.3-0.5s slide ended
+# before the filtered position had moved a full step.
+SCROLL_ONE_EURO_MIN_CUTOFF = 3.0
+SCROLL_ONE_EURO_BETA = 0.05
+# Leaving the scroll pose for less than this continues the slide rather
+# than restarting it (fingers curling at the end of a stroke drop the pose).
+SCROLL_REENTRY_GRACE_S = 0.4
 
 # Cursor: absolute mapping (laser-pointer style), not relative delta. The
 # "active box" is the camera-frame region that maps to the full screen, so
@@ -102,88 +113,97 @@ CURSOR_ONE_EURO_D_CUTOFF = 1.0
 # glitches) so the cursor glides instead of teleporting.
 CURSOR_MAX_JUMP_PX = 400
 
-# Finger extended/curled: tip-to-wrist vs mid-joint-to-wrist ratio,
-# Schmitt-trigger style. Thumb runs on its own scale (its "mid" joint is
-# the much-closer IP joint) - folded reads ~0.52-0.60 vs index/middle's
-# casual ~0.48-0.9, held-out ~1.0-1.45. Ring/pinky raised well above
-# index/middle: tendon linkage partially extends them just from pointing
-# with the index, which was enough to trip open_palm's n_extended>=4 gate
-# and block "point" from ever being reached.
-FINGER_EXTEND_RATIO = {"thumb": 0.9, "index": 1.15, "middle": 1.15, "ring": 1.4, "pinky": 1.4}
-FINGER_CURL_RATIO = {"thumb": 0.75, "index": 0.9, "middle": 0.9, "ring": 1.15, "pinky": 1.15}
+# Finger extension score (gestures.FingerExtension): 0..1, ramping linearly
+# from 0 at the "curled" value to 1 at the "extended" one.
+# Index-pinky: total bend summed over all three joints, from all 4 of the
+# finger's points - ~0-40 deg straight, 200+ in a fist. One pair for all four
+# fingers: their geometry is the same, unlike the old tip/mid-joint distance
+# ratio which needed per-finger values. UNCALIBRATED - telemetry:
+# index_value .. pinky_value (degrees), *_score.
+FINGER_EXTENDED_MAX_BEND = 70.0   # bent this little or less = score 1
+FINGER_CURLED_MIN_BEND = 110.0    # bent this much or more = score 0
+# Thumb: its tip's distance from the index knuckle, in palm widths (its own
+# joints barely bend between tucked and out). UNCALIBRATED - telemetry:
+# thumb_value. Tucked against the index/palm is expected below ~0.9, out in
+# an L shape above ~1.2.
+THUMB_OUT_SPREAD = 1.15  # this far out or more = score 1
+THUMB_IN_SPREAD = 0.9    # this close or closer = score 0
 
-# A candidate pose must hold this many consecutive frames before it's
-# acted on, so a boundary-frame flicker can't fire the wrong action.
-MODE_DEBOUNCE_FRAMES = 6
-
-# Scroll: hand orientation sets direction, not position delta - a fixed
-# tick every held frame reads smoother than a jittery position-delta would.
-SCROLL_STEP = 2
-SCROLL_ORIENTATION_DEADBAND = 0.03  # normalized wrist-to-fingertip vertical gap
+# Pose classifier (gestures.PoseClassifier). Telemetry: conf_* (smoothed,
+# what the choice is made on), raw_conf_* (per frame), pose_confidence.
+# Exponential smoothing per frame: 0.5 at ~16fps settles in ~3 frames
+# (~0.2s) - one noisy frame moves a confidence only halfway.
+POSE_SMOOTHING = 0.5
+POSE_MIN_CONFIDENCE = 0.6   # best pose below this = "none"
+POSE_SWITCH_MARGIN = 0.1    # a new pose must beat the current one by this much
 
 HAND_RELEASE_S = 0.3  # hand goes "inactive" after this long unseen
 
-# 4-or-5-finger hold (toggle tracking) vs. horizontal slide (prev/next
-# track) vs. vertical move (volume, see below). Not calibrated against logs.
-FIVE_DOWN_HOLD_TOGGLE_S = 0.7
-PALM_QUICK_OPEN_MIN_S = 0.1  # below this = noise, not a deliberate quick-open flash
+# Open palm held still this long = muted, until the palm is released. Not
+# instant: a sweep, and the five-finger close (which starts from an open
+# hand), both pass through an open palm on the way - this gives them time to
+# move first instead of blipping the sound off and on.
+MUTE_HOLD_S = 0.4
 # If the open palm drifts more than this (normalized) from where it opened,
-# it's a swipe/volume gesture and the hold-to-toggle timer restarts from
-# the new spot - so a multi-second volume sweep can't flip tracking. Loose
-# enough that ordinary hold jitter (measured from a fixed anchor) stays
-# well under it; a real sweep (~0.2-0.4) blows past it instantly.
-# Raised from 0.13: that sat right on top of ordinary hold jitter, which
-# kept resetting the toggle a fraction of a second before it would've
-# succeeded (the dominant cause of a slow tracking-on). 0.20 sits above
-# normal jitter but below a genuine swipe/volume movement.
+# it's a sweep and the mute timer restarts from the new spot. Loose enough
+# that ordinary hold jitter (measured from a fixed anchor) stays well under
+# it; a real sweep (~0.2-0.4) blows past it instantly. Telemetry: palm_drift.
 PALM_HOLD_MAX_DRIFT = 0.20
-# An open-palm stroke commits to one axis (swipe vs. volume) once its speed
-# passes MIN and one axis dominates the other by AXIS_RATIO; it releases
-# when speed drops below SWIPE_SETTLE_SPEED. Keeps a swipe's slight vertical
-# wobble from also nudging volume, and a volume sweep's drift from swiping.
-PALM_STROKE_MIN_SPEED = 0.4
-PALM_STROKE_AXIS_RATIO = 1.5
+
+# Open-palm sweep left = Alt+Tab. Speeds are normalized frame widths/second.
 SWIPE_MIN_SPEED = 0.6
 SWIPE_MAX_CROSS_DRIFT = 0.35  # rejects a diagonal move that isn't clean along one axis
 SWIPE_COOLDOWN_S = 0.35
-SWIPE_SETTLE_SPEED = 0.3  # below this = hand has stopped; also releases the stroke-axis commit
+SWIPE_SETTLE_SPEED = 0.3  # below this = hand has stopped (re-arms the opposite direction)
 
-# Volume = vertical hand motion qualified by orientation: move UP with the
-# pinky on the left = louder, move DOWN with the thumb on the left =
-# quieter. The orientation requirement makes the return stroke a no-op
-# (after a volume-up sweep the hand is still pinky-left, which isn't the
-# volume-down orientation). Only ticks while actually moving. Uncalibrated:
-# MOVE_SPEED sits above resting jitter but below SWIPE_MIN_SPEED.
-VOLUME_MOVE_SPEED = 0.3        # min |vertical wrist speed| (normalized/s) to count
-VOLUME_TICK_COOLDOWN_S = 0.15  # tick rate while moving
-VOLUME_ORIENT_MARGIN = 0.03    # min thumb/pinky X gap to count as a definite orientation
+# Knob (thumb + index out, rest curled - poses/knob.py KnobDetector): zoom from
+# the gap between the two fingertips, volume from the hand turning. UNCALIBRATED - telemetry: knob_mode,
+# knob_d_gap, knob_d_angle.
+# Zoom: one step per this much change in log(thumb-index gap / hand size) -
+# 0.15 = the fingers ~16% further apart (zoom in) or closer (zoom out).
+# Fully open L to touching is ~2 in log terms, i.e. a dozen-odd steps.
+ZOOM_STEP = 0.15
+# Volume: one step per this many degrees of the hand turning.
+VOLUME_STEP_DEG = 12.0
+# +1: clockwise as seen in the (mirrored) debug window = volume up. Flip to
+# -1 if it comes out backwards.
+VOLUME_CLOCKWISE_SIGN = 1
+# Fingers still for this long = the movement is over: drop the zoom/volume
+# commit and re-anchor, so the next movement can pick either axis afresh.
+# "Still" = net change over that window under these average speeds (log
+# gap/s, deg/s) - a slow deliberate movement keeps accumulating, a resting
+# hand's drift doesn't.
+KNOB_IDLE_RELEASE_S = 0.8
+KNOB_STILL_GAP_SPEED = 0.12
+KNOB_STILL_TURN_SPEED = 8.0
+# Leaving the knob pose for less than this keeps its progress: a thumb on the
+# knob/point boundary (spread ~0.95-1.05 in recordings) flips the pose for a
+# frame or two mid-movement.
+KNOB_REENTRY_GRACE_S = 0.6
+# After a click whose bend wobbled the pose into knob, the knob waits this
+# long (the index finishing its straighten) and then re-anchors, so the
+# click's own bend doesn't register as a pinch.
+KNOB_CLICK_SETTLE_S = 0.3
+# The knob pose must last this long before it counts: shorter is the thumb
+# reading wobbling over the knob/point line while pointing, and treating it
+# as a real knob froze the cursor (KNOB_REENTRY_GRACE_S) - a stutter every
+# couple of seconds in recordings. Zoom/volume steps accumulate from the
+# start and fire once it's passed, so nothing is lost.
+KNOB_MIN_SESSION_S = 0.4
+# While pointing, the cursor keeps tracking through blips of up to this long
+# where the pose reads "none" or a too-short knob, as long as the index is
+# still extended - instead of freezing on every one.
+POINT_COAST_S = 0.4
+KNOB_MAX_STEPS_PER_FRAME = 3  # caps a burst when tracking catches up after a dropout
+KNOB_ONE_EURO_MIN_CUTOFF = 1.5  # smooths the size/angle signals before stepping
+KNOB_ONE_EURO_BETA = 0.05
 
-# Zoom-out: pinch. Must stay looser than GRAB_PINCH_RATIO (see its comment).
-ZOOM_PINCH_RATIO = 0.28   # pinch_ratio below this = pinched = zoom out
-ZOOM_ENTRY_DEBOUNCE_FRAMES = 3  # consecutive frames past a threshold before the first fire
-ZOOM_COOLDOWN_S = 0.3
-
-# Zoom-in: a traced checkmark (down-stroke then a longer up-right stroke)
-# instead of a pose - the previous L-shape thumb-index angle almost never
-# occurred naturally (median ~15 degrees, not the ~90 needed). All below
-# are uncalibrated - retune from the checkmark_leg1/leg2 telemetry columns.
-CHECKMARK_WINDOW_S = 0.7        # how far back fingertip samples are kept - also caps stroke duration
-CHECKMARK_MIN_LEG1 = 0.02       # first (down) leg's minimum length
-CHECKMARK_MIN_LEG2 = 0.04       # second (up-right) leg's minimum length
-CHECKMARK_MIN_DOWN = 0.015      # first leg's minimum downward movement
-CHECKMARK_MIN_UP = 0.02         # second leg's minimum upward movement
-CHECKMARK_MIN_RIGHT = 0.01      # second leg's minimum rightward movement
-CHECKMARK_LEG_RATIO = 1.2       # second leg must be at least this many times longer than the first
-CHECKMARK_COOLDOWN_S = 0.6      # a one-shot stroke, not a held pose
-# Rejects a stroke if the index z-velocity (see TOUCH_DOWN/UP_VELOCITY)
-# spiked past this anywhere in the checkmark's window - a real checkmark
-# trace stays flat in depth; a tap attempt (reaching toward the camera)
-# doesn't, but still wobbles on screen enough to satisfy the shape checks
-# above. Shape alone (leg lengths, their ratio) never reliably separated
-# real checkmarks from accidental hover-wobble misfires; combining this
-# zvel cap with CHECKMARK_MIN_STROKE_SPEED (below) is what worked, though
-# it's a real recall/false-positive tradeoff, not a clean cutoff - tighter
-# blocks more misfires but also rejects more genuine checkmarks. The two
-# gates are only proven as a pair, not individually.
-CHECKMARK_MAX_ZVEL = 0.5
-CHECKMARK_MIN_STROKE_SPEED = 0.454
+# Five-fingertip close = window overview (gestures.BunchDetector). Spread =
+# mean fingertip distance from their centroid, in palm widths. UNCALIBRATED
+# - telemetry: tip_spread.
+BUNCH_OPEN_SPREAD = 0.55     # above this = hand open (arms the gesture)
+BUNCH_CLOSED_SPREAD = 0.30   # below this, after being open = fires
+BUNCH_WINDOW_S = 0.8         # the open->closed motion must happen within this
+# A fist brings the tips together too; bunched fingers bend mostly at the
+# knuckles (~60-120 deg total each), a fist curls every joint (200+)
+BUNCH_MAX_MEAN_BEND = 160.0
